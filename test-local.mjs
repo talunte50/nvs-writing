@@ -165,6 +165,17 @@ await T("真实 AI：流水线 minimal（含真实 LLM 起草+提取+回写）",
   console.log("  正文前80字:", (r.body.content || "").slice(0, 80).replace(/\n/g, " "));
 });
 
+await T("起草为空 → 流水线中止不落库（空章节守卫）", async () => {
+  // 临时 mock：用一本无 LLM 配置的用户跑流水线，LLM 调用会因无 key 抛错，不应产生章节
+  const c3 = await call("POST", "/api/admin/codes", { count: 1 }, adminTok);
+  const tokC = (await call("POST", "/api/register", { email: "c2@test.dev", password: "pass000", invite: c3.body.codes[0] })).body.token;
+  const bk = await call("POST", "/api/books", { title: "守卫书" }, tokC);
+  const r = await call("POST", `/api/books/${bk.body.id}/pipeline`, { mode: "minimal" }, tokC);
+  assert(r.status === 500, "no LLM key should 500, got " + r.status);
+  const chs = await call("GET", `/api/books/${bk.body.id}/chapters`, null, tokC);
+  assert(chs.body.length === 0, "no chapter should be written, got " + chs.body.length);
+});
+
 await T("回写验证：紧急伏笔仍在 + 事件流入库", async () => {
   const det = await call("GET", `/api/books/${book}`, null, tokA);
   // 三年之约（urgency 90）未被回收，应保持 open
