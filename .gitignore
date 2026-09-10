@@ -2,3 +2,4 @@ node_modules/
 wrangler.local.toml
 .env
 *.log
+.wrangler/
