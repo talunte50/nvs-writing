@@ -1,0 +1,18 @@
+name = "nvs-writing"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# 首次部署后由 wrangler 自动填充 database_id
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "nvs-db"
+# database_id = "<wrangler d1 create nvs-db 输出的 id>"
+
+# API Key 建议放 Secret：npx wrangler secret put LLM_KEY
+# [vars]
+# LLM_KEY = ""
+
+# 可选：启用 Cloudflare Workers AI 作为 LLM 提供商（前端"设置"里选 cf-ai）
+# [[ai]]
+# binding = "AI"
+# 注意：还需在 CF 控制台 Account 页开启 AI capabilities
