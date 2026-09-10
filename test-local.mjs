@@ -1,20 +1,17 @@
-// 本地测试：用 node:sqlite 模拟 D1，真实请求打到 worker 的 fetch
+// 本地测试（多租户版）：node:sqlite 模拟 D1，真实请求打到 worker 的 fetch
 import { DatabaseSync } from "node:sqlite";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-
-// LLM key（从本机配置取，不打印）
 import { execSync } from "node:child_process";
+
 const orKey = execSync(
   "grep -oE 'sk-or-v1-[A-Za-z0-9]{20,}' '/root/.hermes/common_models.py' | head -1"
 ).toString().trim();
 
 const db = new DatabaseSync(":memory:");
 db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
-// 把 key 写进 settings
-db.prepare("INSERT INTO settings(key,value) VALUES('llm_key',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(orKey);
 
-// 模拟 D1 binding（完整双写：prepare 直接可 .all()/.first()/.run()，也可 .bind()）
+// 模拟 D1 binding
 function stmt(sql, args) {
   const st = db.prepare(sql);
   const run = () => { const r = st.run(...args); return { meta: { last_rowid: Number(r.lastInsertRowid ?? 0), changes: Number(r.changes ?? 0) } }; };
@@ -28,89 +25,133 @@ function stmt(sql, args) {
   };
 }
 const DB = { prepare: (sql) => stmt(sql, []) };
-
-const env = { DB, LLM_KEY: "" };
+const env = { DB, LLM_KEY: "" }; // 注意：不走默认，LLM_KEY 留空
 const mod = await import(pathToFileURL(process.argv[2] || "./worker.js"));
 const handler = mod.default;
 
-function hit(method, path, body) {
-  return fetch("http://nvs-writing.local" + path, {
-    method,
-    body: body ? JSON.stringify(body) : undefined,
-    headers: body ? { "Content-Type": "application/json" } : {},
-  }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => r.text()) }));
-}
-function get(path) { return fetch("http://nvs-writing.local" + path).then(r => r.text()); }
-
-// 路由调用
-async function call(req) { return handler.fetch(req, env); }
-
-// 通过自定义协议打给 handler
 const http = await import("node:http");
 const server = http.createServer((req, res) => {
   (async () => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
     const body = Buffer.concat(chunks).toString();
-    const r = new Request("http://nvs.local" + req.url, { method: req.method, body: req.method === "GET" ? undefined : body, headers: { "Content-Type": "application/json" } });
-    const out = await call(r);
+    const r = new Request("http://nvs.local" + req.url, {
+      method: req.method,
+      body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+      headers: { "Content-Type": "application/json", ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
+    });
+    const out = await handler.fetch(r, env);
     res.statusCode = out.status;
     res.setHeader("Content-Type", out.headers.get("Content-Type") || "text/plain");
     res.end(await out.text());
   })();
 });
-await new Promise((r) => server.listen(8787, r));
-console.log("mock server :8787");
+await new Promise((r) => server.listen(8788, r));
+console.log("mock server :8788");
 
-// ---- 冒烟测试 ----
+const B = "http://127.0.0.1:8788";
+async function call(method, path, body, token) {
+  const headers = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = "Bearer " + token;
+  const r = await fetch(B + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  return { status: r.status, body: await r.json().catch(() => r.text()) };
+}
+
 let fail = 0;
-const T = async (name, fn) => { try { await fn(); console.log("PASS", name); } catch (e) { fail++; console.log("FAIL", name, "-", e.message?.slice(0, 200)); } };
+const T = async (name, fn) => { try { await fn(); console.log("PASS", name); } catch (e) { fail++; console.log("FAIL", name, "-", (e.message || String(e)).slice(0, 200)); } };
+const assert = (c, m) => { if (!c) throw new Error(m); };
 
-await T("GET / 返回 HTML", async () => {
-  const r = await (await fetch("http://127.0.0.1:8787/")).text();
-  if (!r.includes("NVS")) throw new Error("html missing");
+let tokA, tokB, book, ch;
+
+await T("GET / 返回 HTML（登录页）", async () => {
+  const r = await (await fetch(B + "/")).text();
+  assert(r.includes("NVS") && r.includes("li_email"), "html missing login");
 });
 
-let book, ch;
-await T("POST /api/books", async () => {
-  const r = await (await fetch("http://127.0.0.1:8787/api/books", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: "测试书", genre: "玄幻", logline: "少年获得残缺天书，踏上逆袭之路", world_setting: "九州大陆，灵气复苏", characters: "李七（主角）、老顽（师父）" }) })).json();
-  book = r.id; if (!book) throw new Error("no id");
+await T("未认证 /api/books → 401", async () => {
+  const r = await call("GET", "/api/books");
+  assert(r.status === 401, "expected 401, got " + r.status);
 });
 
-await T("POST /api/ai/outline（真实LLM）", async () => {
-  const r = await (await fetch("http://127.0.0.1:8787/api/ai/outline", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bookId: book, count: 5 }) })).json();
-  if (!r.text || r.text.length < 50) throw new Error("outline too short: " + JSON.stringify(r).slice(0, 200));
-  console.log("  outline 前80字:", r.text.slice(0, 80).replace(/\n/g, " "));
+await T("POST /api/register → token", async () => {
+  const r = await call("POST", "/api/register", { email: "a@test.dev", password: "pass123" });
+  assert(r.status === 200 && r.body.token, JSON.stringify(r.body).slice(0, 120));
+  tokA = r.body.token;
 });
 
-await T("POST /api/books/:id/chapters", async () => {
-  const r = await (await fetch("http://127.0.0.1:8787/api/books/" + book + "/chapters", { method: "POST" })).json();
-  ch = r.id; if (!ch) throw new Error("no id");
+await T("重复注册 → 409", async () => {
+  const r = await call("POST", "/api/register", { email: "a@test.dev", password: "pass123" });
+  assert(r.status === 409, "got " + r.status);
 });
 
-await T("POST /api/ai/write continue（真实LLM，300字）", async () => {
-  const r = await (await fetch("http://127.0.0.1:8787/api/ai/write", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bookId: book, chapterId: ch, action: "continue", words: 300 }) })).json();
-  if (!r.text || r.text.length < 50) throw new Error("write failed: " + JSON.stringify(r).slice(0, 300));
-  console.log("  正文前100字:", r.text.slice(0, 100).replace(/\n/g, " "));
+await T("POST /api/login 正确/错误密码", async () => {
+  let r = await call("POST", "/api/login", { email: "a@test.dev", password: "wrong" });
+  assert(r.status === 401, "bad pw should 401, got " + r.status);
+  r = await call("POST", "/api/login", { email: "a@test.dev", password: "pass123" });
+  assert(r.status === 200 && r.body.token, JSON.stringify(r.body));
 });
 
-await T("PATCH chapter + summarize", async () => {
-  await fetch("http://127.0.0.1:8787/api/chapters/" + ch, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: "第一章 少年李七在雪夜拾到残卷……（测试正文）", ai_kind: "continue" }) });
-  const r = await (await fetch("http://127.0.0.1:8787/api/ai/write", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bookId: book, chapterId: ch, action: "summarize" }) })).json();
-  if (!r.text) throw new Error("summarize failed");
-  const c = await (await fetch("http://127.0.0.1:8787/api/chapters/" + ch)).json();
-  if (!c.summary) throw new Error("summary not saved");
-  console.log("  摘要:", c.summary.slice(0, 60));
+await T("认证后 /api/settings 初始无 Key", async () => {
+  const r = await call("GET", "/api/settings", null, tokA);
+  assert(r.status === 200 && r.body.has_key === false, JSON.stringify(r.body));
 });
 
-await T("GET /api/books 列表含章节数", async () => {
-  const r = await (await fetch("http://127.0.0.1:8787/api/books")).json();
-  if (!Array.isArray(r) || !r.find((b) => b.id === book && b.chapter_count === 1)) throw new Error("list wrong: " + JSON.stringify(r).slice(0,150));
+await T("未配 Key 时 AI 调用 → 明确报错", async () => {
+  const b = await call("POST", "/api/books", { title: "t" }, tokA);
+  book = b.body.id;
+  const chR = await call("POST", `/api/books/${book}/chapters`, {}, tokA);
+  ch = chR.body.id;
+  const r = await call("POST", "/api/ai/write", { bookId: book, chapterId: ch, action: "continue" }, tokA);
+  assert(r.status === 500 && /API Key/.test(r.body.error), JSON.stringify(r.body));
 });
 
-await T("POST /api/settings 错误密码 403", async () => {
-  const r = await fetch("http://127.0.0.1:8787/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ admin_token: "wrong" }) });
-  if (r.status !== 403) throw new Error("expected 403, got " + r.status);
+await T("用户隔离：B 看不到 A 的书", async () => {
+  const r = await call("POST", "/api/register", { email: "b@test.dev", password: "pass456" });
+  tokB = r.body.token;
+  const books = await call("GET", "/api/books", null, tokB);
+  assert(books.body.length === 0, "B sees " + books.body.length + " books");
+  const c = await call("GET", `/api/chapters/${ch}`, null, tokB);
+  assert(c.status === 404, "B should not read A's chapter, got " + c.status);
+});
+
+await T("B 建书成功（各自独立）", async () => {
+  const r = await call("POST", "/api/books", { title: "B的书" }, tokB);
+  assert(r.status === 200 && r.body.id, JSON.stringify(r.body));
+});
+
+await T("A 配置自己的 LLM Key + 真实 AI 大纲", async () => {
+  const s = await call("POST", "/api/settings", { provider: "openai", base_url: "https://openrouter.ai/api/v1", model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", api_key: orKey }, tokA);
+  assert(s.status === 200, JSON.stringify(s.body));
+  const b = await call("GET", "/api/books", null, tokA);
+  const bk = b.body.find((x) => x.title === "t");
+  await call("PATCH", `/api/books/${bk.id}`, { logline: "少年获得残缺天书，踏上逆袭之路" }, tokA);
+  const o = await call("POST", "/api/ai/outline", { bookId: bk.id, count: 5 }, tokA);
+  assert(o.status === 200 && (o.body.text || "").length > 30, JSON.stringify(o.body).slice(0, 200));
+  console.log("  大纲前80字:", (o.body.text || "").slice(0, 80).replace(/\n/g, " "));
+});
+
+await T("B 未配 Key（隔离验证：A 的 Key 不影响 B）", async () => {
+  const s = await call("GET", "/api/settings", null, tokB);
+  assert(s.body.has_key === false, "B has_key should be false");
+});
+
+await T("A 真实 AI 续写", async () => {
+  const b = await call("GET", "/api/books", null, tokA);
+  const bk = b.body.find((x) => x.title === "t");
+  const chs = await call("GET", `/api/books/${bk.id}/chapters`, null, tokA);
+  const r = await call("POST", "/api/ai/write", { bookId: bk.id, chapterId: chs.body[0].id, action: "continue", words: 200 }, tokA);
+  assert(r.status === 200 && (r.body.text || "").length > 30, JSON.stringify(r.body).slice(0, 200));
+  console.log("  正文前80字:", (r.body.text || "").slice(0, 80).replace(/\n/g, " "));
+});
+
+await T("token 重置（POST /api/account）", async () => {
+  const r = await call("POST", "/api/account", { reset_token: true }, tokA);
+  assert(r.status === 200 && r.body.token, JSON.stringify(r.body));
+  const old = await call("GET", "/api/books", null, tokA);
+  assert(old.status === 401, "old token should be invalid");
+  tokA = r.body.token;
+  const ok = await call("GET", "/api/books", null, tokA);
+  assert(ok.status === 200, "new token should work");
 });
 
 server.close();

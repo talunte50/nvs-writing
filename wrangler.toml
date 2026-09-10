@@ -8,7 +8,7 @@ compatibility_date = "2026-01-01"
 # database_name = "nvs-db"
 # database_id = "<wrangler d1 create nvs-db 输出的 id>"
 
-# API Key 建议放 Secret：npx wrangler secret put LLM_KEY
+
 # [vars]
 # LLM_KEY = ""
 
