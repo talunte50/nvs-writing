@@ -82,14 +82,26 @@ async function chat(env, s, messages, { maxTokens = 4000, temperature = 0.8 } = 
   if (!s.api_key) throw new Error("未配置 LLM API Key：请在「设置」填写 LLM 地址/模型/Key，或联系管理员配置站点 Key");
   const base = (s.base_url || LLM_DEFAULTS.base_url).trim();
   const url = base.endsWith("/chat/completions") ? base : base.replace(/\/+$/, "") + "/chat/completions";
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${s.api_key}`, "HTTP-Referer": "https://nvs-writing.workers.dev", "X-Title": "nvs-writing" },
-    body: JSON.stringify({ model: s.model, messages, max_tokens: maxTokens, temperature }),
-  });
-  if (!resp.ok) throw new Error(`LLM ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
-  const data = await resp.json();
-  return data.choices?.[0]?.message?.content ?? "";
+  const doChat = async (mt) => {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${s.api_key}`, "HTTP-Referer": "https://nvs-writing.workers.dev", "X-Title": "nvs-writing" },
+      body: JSON.stringify({ model: s.model, messages, max_tokens: mt, temperature }),
+    });
+    if (!resp.ok) throw new Error(`LLM ${resp.status}: ${(await resp.text().catch(() => "")).slice(0, 300)}`);
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content ?? "";
+  };
+  // 429/5xx 自动退避重试（限流是常态）：最多 4 次，间隔 5/10/20/40s 带抖动
+  for (let attempt = 0; ; attempt++) {
+    try { return await doChat(maxTokens); }
+    catch (e) {
+      const m = /LLM (\d{3})/.exec(String(e.message));
+      const retryable = m && (m[1] === "429" || Number(m[1]) >= 500);
+      if (!retryable || attempt >= 4) throw e;
+      await new Promise((r) => setTimeout(r, [5000, 10000, 20000, 40000][attempt] * (0.8 + Math.random() * 0.4)));
+    }
+  }
 }
 async function logUsage(env, email, action, ok) {
   try { await env.DB.prepare("INSERT INTO ai_usage(user_email, action, ok) VALUES(?,?,?)").bind(email, action, ok ? 1 : 0).run(); } catch {}
