@@ -133,9 +133,12 @@ async function buildTaskSheet(env, s, book, target, mode) {
     (mode === "fast"
       ? "请输出三段任务书：①本章目标与禁区 ②出场人物状态与动机 ③节奏与结尾钩子方向。只输出任务书文本。"
       : "请输出五段写作任务书：①开篇委托（章号/标题/一句话目标）②这章的故事（前文承接、本章目标与阻力、必须覆盖与禁区、紧急伏笔处理）③这章的人物（每人：状态、驱动力、本章作用、说话倾向）④怎么写更顺（节奏、情绪走向、避免 AI 味）⑤收在哪里（结尾停在什么感觉、留什么未完感）。只输出任务书，自然语气，不要出现系统术语。");
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: 0.4 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 4000, temperature: 0.4 });
   return { taskSheet: out, item, urgent };
 }
+// reasoning 模型（如 agnes）思考过程与正文共享 max_tokens 预算：预算不足会 finish_reason=length 且正文为空。
+// 统一放大预算；起草类结果若为空再升预算重试一次。
+function draftBudget(words) { return Math.min(12000, Math.max(4000, (Number(words) || 2000) * 4)); }
 
 // ---------- 流水线：起草（writer：只按任务书起草，纯正文，无占位符） ----------
 async function buildDraft(env, s, book, target, taskSheet) {
@@ -144,7 +147,10 @@ async function buildDraft(env, s, book, target, taskSheet) {
   const user =
     `【书名】${book.title}\n【故事梗概】${book.logline}\n\n【写作任务书】\n${taskSheet}\n\n` +
     `【本章】第${target.seq}章 ${target.title || "（按任务书标题）"}\n请起草本章正文，约${target.words}字。`;
-  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(8000, Math.max(2000, (target.words || 2000) * 2)), temperature: 0.85 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.85 });
+  if (out && out.trim()) return out;
+  // reasoning 模型思考吃满预算 → 正文为空：升预算重试一次
+  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(16000, draftBudget(target.words) * 1.5), temperature: 0.85 });
 }
 
 // ---------- 流水线：五维审查（reviewer：严格 JSON，5 维度逐一结论） ----------
@@ -169,7 +175,7 @@ async function fixBlocking(env, s, book, target, draft, review) {
   const system = "你是网文编辑。针对审查列出的阻断问题做定点修复：只修改对应句段，不改剧情走向、不违反设定。输出修复后的完整正文，只输出正文。";
   const user =
     `【本章正文 第${target.seq}章】\n${draft}\n\n【阻断问题清单】\n${blocking.map((i, n) => `${n + 1}. [${i.category}] ${i.location}：${i.description}（证据：${i.evidence}；方向：${i.fix_hint}）`).join("\n")}\n\n请定点修复后输出完整正文。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(8000, Math.max(2000, (target.words || 2000) * 2)), temperature: 0.4 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.4 });
   return { content: out, fixed: blocking.length };
 }
 
@@ -181,7 +187,7 @@ async function buildPolish(env, s, book, target, content, review, mode) {
     '你是网文润色编辑。执行顺序：①修复非阻断审查问题 ②风格统一（口吻/视角）③排版（段落断行）④Anti-AI 终检（去 AI 味：删掉"值得注意的是""总而言之"式套话，拆长句，具体化描写，保留对话个性）。只改表达不改事实与情节。输出润色后的完整正文，只输出正文。';
   const user =
     `【本章正文 第${target.seq}章】\n${content}\n\n【非阻断问题】${nonBlocking.length ? nonBlocking.map((i) => `- [${i.category}] ${i.description}（${i.fix_hint}）`).join("\n") : "（无）"}\n\n请润色后输出完整正文。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(8000, Math.max(2000, (target.words || 2000) * 2)), temperature: 0.4 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.4 });
   return { content: out, skipped: false };
 }
 
@@ -275,6 +281,7 @@ async function runPipeline(env, email, book, target) {
   steps.step1_ms = Date.now() - t0;
   // Step 2 起草
   let draft = await buildDraft(env, s, book, target, ctx.taskSheet);
+  if (!draft || !draft.trim()) { await logUsage(env, email, "pipeline:draft-empty", false); throw new Error("起草正文为空（LLM 返回空），已中止，未落库。请重试或检查 LLM 配置。"); }
   steps.step2_ms = Date.now() - t0;
   // Step 3 审查（minimal 跳过；fast 仅 3 维 —— 通过 system 裁剪已由 mode 体现：这里 fast 也全跑 5 维，成本可控）
   let review = { parsed: null, raw: "" };
