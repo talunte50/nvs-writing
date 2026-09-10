@@ -1,6 +1,10 @@
-// NVS-Writing — CF Workers 多租户 AI 小说写作系统（Workers + D1，无构建步骤）
-// 认证：邮箱注册 / 登录 → 返回访问 token；数据按用户隔离
-// LLM：OpenAI 通用格式（客户自填 Base URL + 模型 + Key）或 Cloudflare Workers AI
+// NVS-Writing v2 — CF Workers 多租户 AI 小说写作系统（Workers + D1，无构建步骤）
+// 流水线忠实复刻 webnovel-writer 6 步链路（CF 单线程约束下映射为 5 次 LLM + 1 次确定性回写）：
+// ① 写作任务书（context-agent 五段）→ ② 起草（writer）→ ③ 五维审查（reviewer 严格 JSON）
+// → ④ 润色（定点修 blocking + anti-AI）→ ⑤ 事实提取（data-agent extraction schema）→ ⑥ 确定性回写
+// 三大定律：大纲即法律 / 设定即物理 / 上章钩子必须回应。
+// 回写落库：chapters(summary/hook/review_json/status) + foreshadows(open_loop 埋/收) + roles(state_note)
+//           + chapter_events(事件流) + outline_items(推进状态)。blocking>0 → rejected，不落库为 committed。
 
 const LLM_DEFAULTS = {
   provider: "openai",
@@ -12,10 +16,9 @@ const LLM_DEFAULTS = {
 function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*", ...extraHeaders },
+    headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "***", ...extraHeaders },
   });
 }
-
 async function sha256hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -24,20 +27,49 @@ async function genToken() {
   const buf = await crypto.getRandomValues(new Uint8Array(20));
   return [...buf].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+// 从 LLM 输出中提取第一个完整 JSON 对象（reviewer / data-agent 均要求"只输出 JSON"，但模型偶尔夹带前后文）
+function extractJson(text) {
+  const s = String(text || "").trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const src = fence ? fence[1].trim() : s;
+  const start = src.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < src.length; i++) {
+    const c = src[i];
+    if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+    if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) { try { return JSON.parse(src.slice(start, i + 1)); } catch { return null; } } }
+  }
+  return null;
+}
 
-// 认证：Authorization: Bearer <token>
+// 认证：Authorization: Bearer ***（用户 token）
 async function authUser(env, req) {
   const h = req.headers.get("Authorization") || "";
   const m = h.match(/^Bearer\s+(.+)$/i);
   if (!m) return null;
-  const row = await env.DB.prepare("SELECT email FROM users WHERE token=?").bind(m[1].trim()).first();
+  const row = await env.DB.prepare("SELECT email FROM users WHERE token=? AND blocked=0").bind(m[1].trim()).first();
   return row ? row.email : null;
+}
+async function authAdmin(env, req) {
+  const h = req.headers.get("Authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  const row = await env.DB.prepare("SELECT admin_email FROM admin_tokens WHERE token=?").bind(m[1].trim()).first();
+  return row ? row.admin_email : null;
+}
+function isAdmin(email) {
+  // 管理员邮箱同时也是普通用户？不：管理员接口仅认 admin token
+  return !!email;
 }
 
 async function getLlm(env, email) {
   const row = await env.DB.prepare("SELECT provider, base_url, model, api_key FROM llm_settings WHERE user_email=?").bind(email).first();
   const s = { ...LLM_DEFAULTS, api_key: "" };
   if (row) Object.assign(s, row);
+  if (s.provider === "openai" && !s.api_key && env.LLM_KEY) s.api_key = env.LLM_KEY; // 站点级兜底 key（wrangler [vars] LLM_KEY）
   return s;
 }
 
@@ -47,8 +79,7 @@ async function chat(env, s, messages, { maxTokens = 4000, temperature = 0.8 } = 
     const out = await env.AI.run(s.model || "@cf/meta/llama-3.1-8b-instruct", { messages, max_tokens: maxTokens, temperature });
     return out.response ?? "";
   }
-  // OpenAI 通用格式：/chat/completions（OpenRouter / Groq / DeepSeek / Moonshot / Ollama / vLLM…）
-  if (!s.api_key) throw new Error("未配置 LLM API Key：请在右上角「设置」填写你的 LLM 地址/模型/Key 后重试");
+  if (!s.api_key) throw new Error("未配置 LLM API Key：请在「设置」填写 LLM 地址/模型/Key，或联系管理员配置站点 Key");
   const base = (s.base_url || LLM_DEFAULTS.base_url).trim();
   const url = base.endsWith("/chat/completions") ? base : base.replace(/\/+$/, "") + "/chat/completions";
   const resp = await fetch(url, {
@@ -60,33 +91,244 @@ async function chat(env, s, messages, { maxTokens = 4000, temperature = 0.8 } = 
   const data = await resp.json();
   return data.choices?.[0]?.message?.content ?? "";
 }
+async function logUsage(env, email, action, ok) {
+  try { await env.DB.prepare("INSERT INTO ai_usage(user_email, action, ok) VALUES(?,?,?)").bind(email, action, ok ? 1 : 0).run(); } catch {}
+}
+async function bookOrNone(env, p, email) {
+  return await env.DB.prepare("SELECT b.* FROM books b WHERE b.id=? AND b.owner_email=?").bind(p.id, email).first();
+}
 
-// ---------- 上下文组装（大纲 + 设定 + 前情摘要） ----------
-async function buildContextPrompt(env, book, chapter, task) {
-  const parts = [];
-  if (book.logline) parts.push(`【故事梗概】${book.logline}`);
-  if (book.world_setting) parts.push(`【世界观设定】${book.world_setting}`);
-  if (book.characters) parts.push(`【主要角色】${book.characters}`);
-  const toc = await env.DB.prepare("SELECT seq, title FROM chapters WHERE book_id=? ORDER BY seq").bind(book.id).all();
-  if (toc.results?.length) parts.push("【章节大纲】" + toc.results.map((c) => `第${c.seq}章 ${c.title}`).join("；"));
-  if (chapter) {
-    const prevs = (await env.DB.prepare(
-      "SELECT seq, title, summary FROM chapters WHERE book_id=? AND seq < ? AND summary != '' ORDER BY seq DESC LIMIT 6"
-    ).bind(book.id, chapter.seq).all()).results || [];
-    if (prevs.length) parts.push("【前情摘要】" + [...prevs].reverse().map((c) => `第${c.seq}章：${c.summary}`).join("；"));
+// ---------- 流水线：上下文组装（参考 context-agent：数据权重 章纲 > 前情 > 伏笔紧急度 > 角色状态） ----------
+async function buildTaskSheet(env, s, book, target, mode) {
+  // 本章章纲（outline_items 中 seq 最大且 pending 的；或指定 seq）
+  let item = null;
+  if (target?.outlineSeq) {
+    item = (await env.DB.prepare("SELECT * FROM outline_items WHERE book_id=? AND seq=?").bind(book.id, target.outlineSeq).first()) || null;
   }
+  if (!item) {
+    item = (await env.DB.prepare("SELECT * FROM outline_items WHERE book_id=? AND status IN ('pending','in_progress') ORDER BY seq LIMIT 1").bind(book.id).first()) || null;
+  }
+  const roles = (await env.DB.prepare("SELECT name, role_type, profile, is_protagonist, state_note FROM roles WHERE book_id=? ORDER BY is_protagonist DESC, id").bind(book.id).all()).results || [];
+  const loops = (await env.DB.prepare("SELECT * FROM foreshadows WHERE book_id=? AND status='open' ORDER BY urgency DESC LIMIT 8").bind(book.id).all()).results || [];
+  const urgent = loops.filter((l) => l.urgency >= 80);
+  const prevCh = (await env.DB.prepare("SELECT seq, title, summary, hook FROM chapters WHERE book_id=? AND seq < ? AND summary != '' ORDER BY seq DESC LIMIT 3").bind(book.id, target.seq).all()).results || [];
+  const prevs = [...prevCh].reverse();
+  const tocs = (await env.DB.prepare("SELECT seq, title, status FROM chapters WHERE book_id=? ORDER BY seq").bind(book.id).all()).results || [];
+
+  const ctxParts = [];
+  ctxParts.push(`【故事梗概】${book.logline || "（未填写）"}`);
+  if (book.world_setting) ctxParts.push(`【世界观设定】${book.world_setting}`);
+  if (roles.length) ctxParts.push("【角色档案】" + roles.map((r) => `${r.name}（${r.role_type}${r.is_protagonist ? "，主角" : ""}）：${r.profile || "无简介"}${r.state_note ? `｜当前状态：${r.state_note}` : ""}`).join("\n"));
+  if (loops.length) ctxParts.push("【未回收伏笔】" + loops.map((l) => `- ${l.content}（第${l.planted_chapter || "?"}章埋设，紧急度${l.urgency}）`).join("\n"));
+  if (prevs.length) ctxParts.push("【前情摘要】" + prevs.map((c) => `第${c.seq}章 ${c.title}：${c.summary}${c.hook ? `｜结尾钩子：${c.hook}` : ""}`).join("\n"));
+  const targetLine = item ? `第${target.seq}章 ${item.title}：${item.detail || "（无细节）"}` : `第${target.seq}章${target.title ? " " + target.title : ""}${target.outline_note ? "：" + target.outline_note : "（无章纲，按故事自然推进，必须产生情节推进）"}`;
+
   const system =
-    "你是专业网文作者。直接输出中文正文，严禁输出思考过程、计划、解释或英文。保持人物口吻与世界观一致，遵循既有大纲不擅自偏离，新实体自然引入。";
+    "你是网文主编，负责写前 research 并输出五段写作任务书。写作铁律：大纲即法律（章纲目标不可偏离，无法完成时如实标注）、设定即物理（角色能力不得超过既有档案记录）、上章钩子必须回应。" +
+    (mode === "fast" ? "快速模式：任务书精简为三段。" : "标准模式：五段完整任务书。");
   const user =
-    parts.join("\n\n") +
-    (chapter ? `\n\n【当前章节 第${chapter.seq}章 ${chapter.title}】\n${(chapter.content || "").slice(-2500)}` : "") +
-    `\n\n【任务】${task}`;
-  return [{ role: "system", content: system }, { role: "user", content: user }];
+    `${ctxParts.join("\n\n")}\n\n【本章硬性约束】${targetLine}\n` +
+    `【紧急伏笔（必须进入本章）】${urgent.length ? urgent.map((l) => `- ${l.content}`).join("\n") : "（无）"}\n` +
+    `【全书章节进度】${tocs.length ? tocs.map((c) => `第${c.seq}章${c.status === "committed" ? "✓" : ""}`).join(" ") : "（尚无章节）"}\n` +
+    (mode === "fast"
+      ? "请输出三段任务书：①本章目标与禁区 ②出场人物状态与动机 ③节奏与结尾钩子方向。只输出任务书文本。"
+      : "请输出五段写作任务书：①开篇委托（章号/标题/一句话目标）②这章的故事（前文承接、本章目标与阻力、必须覆盖与禁区、紧急伏笔处理）③这章的人物（每人：状态、驱动力、本章作用、说话倾向）④怎么写更顺（节奏、情绪走向、避免 AI 味）⑤收在哪里（结尾停在什么感觉、留什么未完感）。只输出任务书，自然语气，不要出现系统术语。");
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: 0.4 });
+  return { taskSheet: out, item, urgent };
+}
+
+// ---------- 流水线：起草（writer：只按任务书起草，纯正文，无占位符） ----------
+async function buildDraft(env, s, book, target, taskSheet) {
+  const system =
+    '你是专业网文作者。根据写作任务书直接起草本章正文。要求：纯中文正文，禁止输出思考过程/计划/解释/英文，禁止占位符（如"此处省略"）；围绕任务书的章节节点展开；每章必须有情节推进；章末留悬念钩子；只输出正文。';
+  const user =
+    `【书名】${book.title}\n【故事梗概】${book.logline}\n\n【写作任务书】\n${taskSheet}\n\n` +
+    `【本章】第${target.seq}章 ${target.title || "（按任务书标题）"}\n请起草本章正文，约${target.words}字。`;
+  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(8000, Math.max(2000, (target.words || 2000) * 2)), temperature: 0.85 });
+}
+
+// ---------- 流水线：五维审查（reviewer：严格 JSON，5 维度逐一结论） ----------
+async function buildReview(env, s, book, target, draft, taskSheet) {
+  const system =
+    "你是章节事实审查员。只查 5 个维度：设定一致性(setting)、时间线(timeline)、叙事连贯(continuity)、角色一致性(character)、逻辑(logic)。" +
+    "不评分、不评价文笔、不建议情节改动、不重复大纲内容；只报可验证问题，每条必须有 evidence。" +
+    "只输出严格 JSON（无任何其他文本），结构：{\"chapter\":N,\"issues\":[{\"severity\":\"critical|high|medium|low\",\"category\":\"setting|timeline|continuity|character|logic\",\"location\":\"第N段或引用\",\"description\":\"问题描述\",\"evidence\":\"原文引用 vs 数据记录\",\"fix_hint\":\"修复方向\",\"blocking\":true}]," +
+    "\"issues_count\":0,\"blocking_count\":0,\"has_blocking\":false,\"dimension_results\":[{\"dimension\":\"setting\",\"conclusion\":\"pass\"},...必须覆盖全部5维度，无问题写pass],\"summary\":\"N个问题：X个阻断，Y个高优\"}。blocking 仅用于 critical 或确认阻断项。";
+  const user =
+    `【设定基准】${book.world_setting || "（无）"}\n【任务书（含禁区与紧急伏笔）】${taskSheet}\n\n【本章正文 第${target.seq}章】\n${draft}\n\n请审查并只输出 JSON。`;
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 3000, temperature: 0.1 });
+  let parsed = extractJson(out) || null;
+  if (parsed && !Array.isArray(parsed.dimension_results)) parsed.dimension_results = [];
+  return { raw: out, parsed };
+}
+
+// 定点修复 blocking（参考 Step 3 规则：不改剧情不破设定，只修 blocking；不重跑审查）
+async function fixBlocking(env, s, book, target, draft, review) {
+  const blocking = (review?.parsed?.issues || []).filter((i) => i.blocking);
+  if (!blocking.length) return { content: draft, fixed: 0 };
+  const system = "你是网文编辑。针对审查列出的阻断问题做定点修复：只修改对应句段，不改剧情走向、不违反设定。输出修复后的完整正文，只输出正文。";
+  const user =
+    `【本章正文 第${target.seq}章】\n${draft}\n\n【阻断问题清单】\n${blocking.map((i, n) => `${n + 1}. [${i.category}] ${i.location}：${i.description}（证据：${i.evidence}；方向：${i.fix_hint}）`).join("\n")}\n\n请定点修复后输出完整正文。`;
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(8000, Math.max(2000, (target.words || 2000) * 2)), temperature: 0.4 });
+  return { content: out, fixed: blocking.length };
+}
+
+// ---------- 流水线：润色 + anti-AI 终检（参考 Step 4：只改表达不改事实） ----------
+async function buildPolish(env, s, book, target, content, review, mode) {
+  if (mode === "minimal") return { content, skipped: true };
+  const nonBlocking = (review?.parsed?.issues || []).filter((i) => !i.blocking);
+  const system =
+    '你是网文润色编辑。执行顺序：①修复非阻断审查问题 ②风格统一（口吻/视角）③排版（段落断行）④Anti-AI 终检（去 AI 味：删掉"值得注意的是""总而言之"式套话，拆长句，具体化描写，保留对话个性）。只改表达不改事实与情节。输出润色后的完整正文，只输出正文。';
+  const user =
+    `【本章正文 第${target.seq}章】\n${content}\n\n【非阻断问题】${nonBlocking.length ? nonBlocking.map((i) => `- [${i.category}] ${i.description}（${i.fix_hint}）`).join("\n") : "（无）"}\n\n请润色后输出完整正文。`;
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(8000, Math.max(2000, (target.words || 2000) * 2)), temperature: 0.4 });
+  return { content: out, skipped: false };
+}
+
+// ---------- 流水线：事实提取（data-agent：extraction_result schema，唯一真源见参考项目） ----------
+async function buildExtraction(env, s, book, target, finalContent) {
+  const roles = (await env.DB.prepare("SELECT name FROM roles WHERE book_id=?").bind(book.id).all()).results || [];
+  const openLoops = (await env.DB.prepare("SELECT content, planted_chapter FROM foreshadows WHERE book_id=? AND status='open' LIMIT 20").bind(book.id).all()).results || [];
+  const system =
+    "你是数据 agent，从章节正文提取可跨章复用的故事事实。只输出严格 JSON（无任何其他文本），顶层直接放这些键（禁止外包对象）：\n" +
+    '{"summary_text":"100-150字剧情摘要","hook_type":"结尾钩子类型","hook_strength":"strong|medium|weak","accepted_events":[{"event_id":"evt-ch'+target.seq+'-001","chapter":'+target.seq+',"event_type":"枚举","subject":"主体名（用已知角色名，非 id）","payload":{}}],"state_deltas":[{"entity_id":"角色名","field":"realm","old":"旧","new":"新"}],"entities_appeared":[{"id":"角色名","type":"角色","mentions":["称呼"],"confidence":0.9}]}\n' +
+    "event_type 枚举：character_state_changed / power_breakthrough / relationship_changed / world_rule_revealed / open_loop_created / open_loop_closed / promise_created / promise_paid_off / artifact_obtained。\n" +
+    "payload 必备字段：open_loop_created→{content(必填),urgency(0-100:紧急≈100/一般≈50/远期≈20)}；open_loop_closed→{content,recycled_loops:[]}；character_state_changed→{field,old,new}；power_breakthrough→{field,old,new}。\n" +
+    "纪律：正文里每埋一条新伏笔必须写一条 open_loop_created 事件；回收了既有伏笔必须写 open_loop_closed；拿不准的不写（宁缺毋滥）；不虚构正文未出现的事实。";
+  const user =
+    `【本书已知角色】${roles.map((r) => r.name).join("、") || "（未登记）"}\n【既有未回收伏笔】${openLoops.map((l) => `- ${l.content}（第${l.planted_chapter}章）`).join("\n") || "（无）"}\n\n【本章正文 第${target.seq}章】\n${finalContent}\n\n请提取事实，只输出 JSON。`;
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: 0.1 });
+  return { raw: out, parsed: extractJson(out) };
+}
+
+// ---------- 确定性回写（参考 chapter-commit 判定：blocking>0 → rejected） ----------
+async function commitWriteback(env, book, target, finalContent, review, extraction, title, outlineNote, mode) {
+  const chapter = (await env.DB.prepare("SELECT * FROM chapters WHERE book_id=? AND seq=?").bind(book.id, target.seq).first()) || null;
+  const blockingCount = (review?.parsed?.blocking_count !== undefined && review.parsed.has_blocking !== false) ? Math.max(1, review.parsed.blocking_count || 0) : ((review?.parsed?.issues || []).filter((i) => i.blocking).length);
+  const accepted = blockingCount === 0;
+  const status = accepted ? "committed" : "rejected";
+
+  // 摘要 + 钩子（hook_type/hook_strength 来自 data-agent；无 extraction 则留空待手动补）
+  const summary = extraction?.parsed?.summary_text || "";
+  const hook = extraction?.parsed?.hook_type ? `【${extraction.parsed.hook_type}${extraction.parsed.hook_strength ? "/" + extraction.parsed.hook_strength : ""}】${(extraction.parsed.summary_text || "").slice(-80)}` : "";
+
+  if (chapter) {
+    await env.DB.prepare(
+      "UPDATE chapters SET title=COALESCE(NULLIF(?, ''), title), content=?, status=?, summary=?, hook=?, review_json=?, outline_note=?, ai_kind=?, ai_prompt=?, updated_at=datetime('now') WHERE id=?"
+    ).bind(title, finalContent, status, summary, hook, review?.parsed ? JSON.stringify(review.parsed) : "", outlineNote, "pipeline", target.outlineSeq ? "outline#" + target.outlineSeq : "auto", chapter.id).run();
+  } else {
+    await env.DB.prepare(
+      "INSERT INTO chapters(book_id, seq, title, content, status, summary, hook, review_json, outline_note, ai_kind, ai_prompt) VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+    ).bind(book.id, target.seq, title, finalContent, status, summary, hook, review?.parsed ? JSON.stringify(review.parsed) : "", outlineNote, "pipeline", target.outlineSeq ? "outline#" + target.outlineSeq : "auto").run();
+  }
+
+  // 伏笔回写：open_loop_created → 新伏笔；open_loop_closed → 既有伏笔置 paid
+  const events = extraction?.parsed?.accepted_events || [];
+  let loopsPlanted = 0, loopsRecycled = 0;
+  for (const ev of events) {
+    const pl = ev.payload || {};
+    if (ev.event_type === "open_loop_created" && pl.content) {
+      await env.DB.prepare("INSERT INTO foreshadows(book_id, content, urgency, planted_chapter) VALUES(?,?,?,?)")
+        .bind(book.id, String(pl.content).slice(0, 300), Math.min(100, Math.max(0, Number(pl.urgency) || 50)), target.seq).run();
+      loopsPlanted++;
+    } else if (ev.event_type === "open_loop_closed") {
+      // 回收：按正文关键词匹配紧急度最高的未回收伏笔（确定性、不猜）
+      const target2 = String(pl.content || pl.recycled_loop || "");
+      if (target2) {
+        const hit = (await env.DB.prepare("SELECT id FROM foreshadows WHERE book_id=? AND status='open' AND (content LIKE ?) ORDER BY urgency DESC LIMIT 1").bind(book.id, "%" + target2.slice(0, 20) + "%").first());
+        if (hit) { await env.DB.prepare("UPDATE foreshadows SET status='paid', payoff_chapter=? WHERE id=?").bind(target.seq, hit.id).run(); loopsRecycled++; }
+      } else {
+        const top = (await env.DB.prepare("SELECT id FROM foreshadows WHERE book_id=? AND status='open' ORDER BY urgency DESC LIMIT 1").bind(book.id).first());
+        if (top) { await env.DB.prepare("UPDATE foreshadows SET status='paid', payoff_chapter=? WHERE id=?").bind(target.seq, top.id).run(); loopsRecycled++; }
+      }
+    }
+  }
+  // 事件流落库（长期记忆 events）
+  for (const ev of events) {
+    if (ev.event_type) {
+      await env.DB.prepare("INSERT INTO chapter_events(book_id, chapter_seq, event_type, subject, payload) VALUES(?,?,?,?,?)")
+        .bind(book.id, target.seq, ev.event_type, String(ev.subject || ""), JSON.stringify(ev.payload || {})).run();
+    }
+  }
+  // 角色状态回写：state_deltas / character_state_changed → roles.state_note
+  const deltas = extraction?.parsed?.state_deltas || [];
+  for (const d of deltas) {
+    if (!d.entity_id || !d.new) continue;
+    const note = `${d.field || "状态"}: ${d.old ? `${d.old}→` : ""}${d.new}`;
+    const ex = await env.DB.prepare("SELECT id FROM roles WHERE book_id=? AND name=?").bind(book.id, d.entity_id).first();
+    if (ex) await env.DB.prepare("UPDATE roles SET state_note=? WHERE id=?").bind(note.slice(0, 200), ex.id).run();
+  }
+  // 大纲推进：本章对应的 outline item 状态推进（done 若 accepted，in_progress 若 rejected）
+  if (target.outlineSeq) {
+    await env.DB.prepare("UPDATE outline_items SET status=? WHERE book_id=? AND seq=?").bind(accepted ? "done" : "in_progress", book.id, target.outlineSeq).run();
+  }
+  return { status, blockingCount, loopsPlanted, loopsRecycled, events: events.length, summary, hook };
+}
+
+// 完整流水线入口：POST /api/pipeline/run
+async function runPipeline(env, email, book, target) {
+  const s = await getLlm(env, email);
+  const t0 = Date.now();
+  const steps = { mode: target.mode || "standard" };
+  // Step 1 任务书
+  const ctx = await buildTaskSheet(env, s, book, target, target.mode);
+  steps.step1_ms = Date.now() - t0;
+  // Step 2 起草
+  let draft = await buildDraft(env, s, book, target, ctx.taskSheet);
+  steps.step2_ms = Date.now() - t0;
+  // Step 3 审查（minimal 跳过；fast 仅 3 维 —— 通过 system 裁剪已由 mode 体现：这里 fast 也全跑 5 维，成本可控）
+  let review = { parsed: null, raw: "" };
+  if (target.mode !== "minimal") {
+    review = await buildReview(env, s, book, target, draft, ctx.taskSheet);
+  } else {
+    review = { parsed: { chapter: target.seq, issues: [], issues_count: 0, blocking_count: 0, has_blocking: false, review_skipped: true, review_mode: "minimal", summary: "minimal 模式：跳过审查" }, raw: "" };
+  }
+  steps.step3_ms = Date.now() - t0;
+  // blocking 定点修复
+  let fixed = 0;
+  if (target.mode !== "minimal") {
+    const fr = await fixBlocking(env, s, book, target, draft, review);
+    draft = fr.content; fixed = fr.fixed;
+  }
+  // Step 4 润色
+  const polish = await buildPolish(env, s, book, target, draft, review, target.mode);
+  let finalContent = polish.content;
+  steps.step4_ms = Date.now() - t0;
+  // 占位符终检（硬规则：禁止占位正文）—— 确定性检测，命中则降级状态
+  const hasPlaceholder = /此处省略|（略）|\[占位\]|TODO|待补|未完待续处/.test(finalContent);
+  // Step 5 事实提取（minimal 也提取摘要，保证回写链不断）
+  let extraction = null;
+  try { extraction = await buildExtraction(env, s, book, target, finalContent); steps.step5_ms = Date.now() - t0; }
+  catch (e) { extraction = { raw: "", parsed: null, error: String(e.message || e) }; }
+  // Step 6 回写
+  const title = target.title || ((ctx.item?.title) ? ctx.item.title : "第" + target.seq + "章");
+  const wb = await commitWriteback(env, book, target, finalContent, review, extraction, title, target.outline_note || (ctx.item?.detail ? "" : ""), target.mode);
+  if (hasPlaceholder) await env.DB.prepare("UPDATE chapters SET status='rejected' WHERE book_id=? AND seq=?").bind(book.id, target.seq).run();
+  // 全链路用量记录
+  await logUsage(env, email, `pipeline:${target.mode}`, true);
+  return {
+    ok: true, mode: target.mode || "standard", seq: target.seq, title, status: hasPlaceholder ? "rejected" : wb.status,
+    blockingCount: wb.blockingCount, fixed, loopsPlanted: wb.loopsPlanted, loopsRecycled: wb.loopsRecycled, events: wb.events,
+    hasPlaceholder, steps, ms: Date.now() - t0,
+    summary: wb.summary, hook: wb.hook,
+    content: finalContent,
+    review: review.parsed,
+    extraction: extraction?.parsed || null,
+  };
 }
 
 // ---------- API ----------
+async function getSetting(env, key, def = "") {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key=?").bind(key).first();
+  return row ? row.value : def;
+}
+async function setSetting(env, key, value) {
+  await env.DB.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?").bind(key, value, value).run();
+}
+function requireInvite(env) { return true; } // settings.require_invite 在 register 内读
+
 const api = {
-  // ---- 认证 ----
+  // ---- 认证（注册需注册码，管理员可关闭 require_invite） ----
   "POST /api/register": async (env, req) => {
     const b = await req.json().catch(() => ({}));
     const email = String(b.email || "").trim().toLowerCase();
@@ -95,6 +337,17 @@ const api = {
     if (password.length < 6) return json({ error: "密码至少 6 位" }, 400);
     const exists = await env.DB.prepare("SELECT 1 FROM users WHERE email=?").bind(email).first();
     if (exists) return json({ error: "该邮箱已注册，请直接登录" }, 409);
+    // 注册码闸门
+    const requireInvite = (await getSetting(env, "require_invite", "1")) === "1";
+    if (requireInvite) {
+      const code = String(b.invite || "").trim().toUpperCase();
+      if (!code) return json({ error: "需要注册码", code_required: true }, 400);
+      const ic = await env.DB.prepare("SELECT * FROM invite_codes WHERE code=?").bind(code).first();
+      if (!ic) return json({ error: "注册码无效" }, 403);
+      if (ic.revoked) return json({ error: "注册码已作废" }, 403);
+      if (ic.used_by) return json({ error: "注册码已被使用" }, 403);
+      await env.DB.prepare("UPDATE invite_codes SET used_by=?, used_at=datetime('now') WHERE code=?").bind(email, code).run();
+    }
     const salt = await genToken();
     const hash = await sha256hex(salt + ":" + email + ":" + password);
     const token = await genToken();
@@ -109,12 +362,19 @@ const api = {
     if (!row) return json({ error: "账号不存在" }, 401);
     const hash = await sha256hex(row.salt + ":" + email + ":" + String(b.password || ""));
     if (hash !== row.pass_hash) return json({ error: "密码错误" }, 401);
+    if (row.blocked) return json({ error: "账号已被停用" }, 403);
     if (!row.token) {
       const t = await genToken();
       await env.DB.prepare("UPDATE users SET token=? WHERE email=?").bind(t, email).run();
       row.token = t;
     }
     return json({ token: row.token, email });
+  },
+  "GET /api/me": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const row = await env.DB.prepare("SELECT email, created_at FROM users WHERE email=?").bind(email).first();
+    const ann = await getSetting(env, "announcement", "");
+    return json({ email, created_at: row?.created_at, announcement: ann, site_name: await getSetting(env, "site_name", "NVS 写作台") });
   },
   "POST /api/account": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
@@ -134,7 +394,106 @@ const api = {
     return json({ ok: true, token });
   },
 
-  // ---- 书 / 章（按用户隔离） ----
+  // ---- 管理端：init 码创建首个管理员（admin_auth 空表时可用） ----
+  "POST /api/admin/init": async (env, req) => {
+    const b = await req.json().catch(() => ({}));
+    const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM admin_auth").first();
+    if (row && row.n > 0) return json({ error: "管理员已存在，不能重复初始化" }, 409);
+    const email = String(b.email || "admin").trim().toLowerCase();
+    const password = String(b.password || "");
+    if (password.length < 8) return json({ error: "管理员密码至少 8 位" }, 400);
+    const salt = await genToken();
+    const hash = await sha256hex(salt + ":" + email + ":" + password);
+    await env.DB.prepare("INSERT INTO admin_auth(email, salt, hash) VALUES(?,?,?)").bind(email, salt, hash).run();
+    const token = await genToken();
+    await env.DB.prepare("INSERT INTO admin_tokens(admin_email, token) VALUES(?,?)").bind(email, token).run();
+    return json({ ok: true, admin_email: email, token });
+  },
+  "POST /api/admin/login": async (env, req) => {
+    const b = await req.json().catch(() => ({}));
+    const email = String(b.email || "").trim().toLowerCase();
+    const row = await env.DB.prepare("SELECT * FROM admin_auth WHERE email=?").bind(email).first();
+    if (!row) return json({ error: "管理员不存在" }, 401);
+    const hash = await sha256hex(row.salt + ":" + email + ":" + String(b.password || ""));
+    if (hash !== row.hash) return json({ error: "密码错误" }, 401);
+    let t = (await env.DB.prepare("SELECT token FROM admin_tokens WHERE admin_email=?").bind(email).first())?.token;
+    if (!t) {
+      t = await genToken();
+      await env.DB.prepare("INSERT INTO admin_tokens(admin_email, token) VALUES(?,?) ON CONFLICT(admin_email) DO UPDATE SET token=excluded.token").bind(email, t).run();
+    }
+    return json({ token: t, admin_email: email });
+  },
+  "GET /api/admin/stats": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const [users, books, chapters, usage, loops, invite] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) AS n FROM users").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM books").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM chapters").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM ai_usage WHERE ts >= datetime('now','-7 day')").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM foreshadows WHERE status='open'").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n FROM invite_codes WHERE used_by IS NULL AND revoked=0").first(),
+    ]);
+    const topUsers = (await env.DB.prepare("SELECT user_email, COUNT(*) AS n FROM ai_usage WHERE user_email!='' GROUP BY user_email ORDER BY n DESC LIMIT 10").all()).results || [];
+    return json({ users: users.n, books: books.n, chapters: chapters.n, usage7d: usage.n, open_loops: loops.n, free_codes: invite.n, top_users: topUsers });
+  },
+  "GET /api/admin/users": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const res = await env.DB.prepare(
+      "SELECT u.email, u.blocked, u.created_at, (SELECT COUNT(*) FROM books b WHERE b.owner_email=u.email) AS books, (SELECT COUNT(*) FROM ai_usage a WHERE a.user_email=u.email) AS ai_calls FROM users u ORDER BY u.created_at DESC LIMIT 200"
+    ).all();
+    return json(res.results ?? []);
+  },
+  "POST /api/admin/users/:email/flag": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const b = await req.json().catch(() => ({}));
+    const email2 = String(p.email).toLowerCase();
+    const blocked = b.blocked ? 1 : 0;
+    await env.DB.prepare("UPDATE users SET blocked=? WHERE email=?").bind(blocked, email2).run();
+    if (blocked) await env.DB.prepare("UPDATE users SET token='' WHERE email=?").bind(email2).run();
+    return json({ ok: true });
+  },
+  "POST /api/admin/codes": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const b = await req.json().catch(() => ({}));
+    const n = Math.min(50, Math.max(1, Number(b.count) || 1));
+    const codes = [];
+    for (let i = 0; i < n; i++) {
+      let c;
+      for (let tries = 0; tries < 5; tries++) {
+        c = "NV-" + (await genToken()).slice(0, 12).toUpperCase();
+        const ex = await env.DB.prepare("SELECT 1 FROM invite_codes WHERE code=?").bind(c).first();
+        if (!ex) break;
+      }
+      await env.DB.prepare("INSERT INTO invite_codes(code) VALUES(?)").bind(c).run();
+      codes.push(c);
+    }
+    if (b.require !== undefined) await setSetting(env, "require_invite", b.require ? "1" : "0");
+    return json({ codes, require_invite: (await getSetting(env, "require_invite", "1")) === "1" });
+  },
+  "GET /api/admin/codes": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const res = await env.DB.prepare("SELECT code, used_by, used_at, revoked, created_at FROM invite_codes ORDER BY created_at DESC LIMIT 200").all();
+    const set = (await getSetting(env, "require_invite", "1")) === "1";
+    return json({ codes: res.results ?? [], require_invite: set });
+  },
+  "POST /api/admin/codes/:code/revoke": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    await env.DB.prepare("UPDATE invite_codes SET revoked=1 WHERE code=?").bind(String(p.code).toUpperCase()).run();
+    return json({ ok: true });
+  },
+  "POST /api/admin/settings": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const b = await req.json().catch(() => ({}));
+    for (const k of ["require_invite", "site_name", "announcement"]) {
+      if (b[k] !== undefined) await setSetting(env, k, String(b[k]));
+    }
+    return json({ ok: true });
+  },
+};
+
+// ---- 用户数据路由：书 / 章 / 角色 / 伏笔 / 大纲 / 流水线 / LLM 设置 ----
+Object.assign(api, {
+  // ---- 书 ----
   "GET /api/books": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
     const res = await env.DB.prepare(
@@ -145,16 +504,26 @@ const api = {
   "POST /api/books": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
     const b = await req.json().catch(() => ({}));
-    const r = await env.DB.prepare(
-      "INSERT INTO books(owner_email, title, genre, logline) VALUES(?,?,?,?)"
-    ).bind(email, b.title || "未命名", b.genre || "", b.logline || "").run();
+    const r = await env.DB.prepare("INSERT INTO books(owner_email, title, genre, logline) VALUES(?,?,?,?)").bind(email, b.title || "未命名", b.genre || "", b.logline || "").run();
     let id = Number(r.meta?.last_rowid);
     if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM books WHERE owner_email=?").bind(email).first())?.m ?? 0);
     return json({ id });
   },
+  "GET /api/books/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const book = await bookOrNone(env, p, email);
+    if (!book) return json({ error: "not found" }, 404);
+    const [roles, loops, items, events] = await Promise.all([
+      env.DB.prepare("SELECT * FROM roles WHERE book_id=? ORDER BY is_protagonist DESC, id").bind(p.id).all(),
+      env.DB.prepare("SELECT * FROM foreshadows WHERE book_id=? ORDER BY urgency DESC, id").bind(p.id).all(),
+      env.DB.prepare("SELECT * FROM outline_items WHERE book_id=? ORDER BY seq").bind(p.id).all(),
+      env.DB.prepare("SELECT event_type, subject, payload, chapter_seq FROM chapter_events WHERE book_id=? ORDER BY chapter_seq DESC, id DESC LIMIT 30").bind(p.id).all(),
+    ]);
+    return json({ book, roles: roles.results || [], loops: loops.results || [], outline: items.results || [], events: events.results || [] });
+  },
   "PATCH /api/books/:id": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
-    const own = await env.DB.prepare("SELECT 1 FROM books WHERE id=? AND owner_email=?").bind(p.id, email).first();
+    const own = await bookOrNone(env, p, email);
     if (!own) return json({ error: "not found" }, 404);
     const b = await req.json().catch(() => ({}));
     const fields = ["title", "genre", "logline", "world_setting", "characters"];
@@ -165,23 +534,27 @@ const api = {
   },
   "DELETE /api/books/:id": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
-    const own = await env.DB.prepare("SELECT 1 FROM books WHERE id=? AND owner_email=?").bind(p.id, email).first();
+    const own = await bookOrNone(env, p, email);
     if (!own) return json({ error: "not found" }, 404);
     await env.DB.prepare("DELETE FROM chapters WHERE book_id=?").bind(p.id).run();
+    await env.DB.prepare("DELETE FROM roles WHERE book_id=?").bind(p.id).run();
+    await env.DB.prepare("DELETE FROM foreshadows WHERE book_id=?").bind(p.id).run();
+    await env.DB.prepare("DELETE FROM outline_items WHERE book_id=?").bind(p.id).run();
+    await env.DB.prepare("DELETE FROM chapter_events WHERE book_id=?").bind(p.id).run();
     await env.DB.prepare("DELETE FROM books WHERE id=?").bind(p.id).run();
     return json({ ok: true });
   },
+
+  // ---- 章 ----
   "GET /api/books/:id/chapters": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
-    const own = await env.DB.prepare("SELECT 1 FROM books WHERE id=? AND owner_email=?").bind(p.id, email).first();
-    if (!own) return json({ error: "not found" }, 404);
-    const res = await env.DB.prepare("SELECT id, book_id, seq, title, ai_kind, summary, created_at, updated_at FROM chapters WHERE book_id=? ORDER BY seq").bind(p.id).all();
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
+    const res = await env.DB.prepare("SELECT id, book_id, seq, title, status, ai_kind, summary, hook, review_json, outline_note, created_at, updated_at FROM chapters WHERE book_id=? ORDER BY seq").bind(p.id).all();
     return json(res.results ?? []);
   },
   "POST /api/books/:id/chapters": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
-    const own = await env.DB.prepare("SELECT 1 FROM books WHERE id=? AND owner_email=?").bind(p.id, email).first();
-    if (!own) return json({ error: "not found" }, 404);
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
     const maxRow = await env.DB.prepare("SELECT MAX(seq) AS m FROM chapters WHERE book_id=?").bind(p.id).first();
     const seq = (maxRow?.m || 0) + 1;
     const r = await env.DB.prepare("INSERT INTO chapters(book_id, seq, title) VALUES(?,?,?)").bind(p.id, seq, "新章节").run();
@@ -201,8 +574,8 @@ const api = {
     if (!own) return json({ error: "not found" }, 404);
     const b = await req.json().catch(() => ({}));
     await env.DB.prepare(
-      "UPDATE chapters SET title=COALESCE(?,title), content=COALESCE(?,content), summary=COALESCE(?,summary), ai_kind=?, ai_prompt=?, updated_at=datetime('now') WHERE id=?"
-    ).bind(b.title ?? null, b.content ?? null, b.summary ?? null, b.ai_kind ?? "", b.ai_prompt ?? "", p.id).run();
+      "UPDATE chapters SET title=COALESCE(?,title), content=COALESCE(?,content), summary=COALESCE(?,summary), hook=COALESCE(?,hook), status=COALESCE(?,status), updated_at=datetime('now') WHERE id=?"
+    ).bind(b.title ?? null, b.content ?? null, b.summary ?? null, b.hook ?? null, b.status ?? null, p.id).run();
     return json({ ok: true });
   },
   "DELETE /api/chapters/:id": async (env, req, p, email) => {
@@ -211,6 +584,143 @@ const api = {
     if (!own) return json({ error: "not found" }, 404);
     await env.DB.prepare("DELETE FROM chapters WHERE id=?").bind(p.id).run();
     return json({ ok: true });
+  },
+
+  // ---- 角色（设定集）----
+  "POST /api/books/:id/roles": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    if (!b.name || !String(b.name).trim()) return json({ error: "角色名必填" }, 400);
+    const r = await env.DB.prepare("INSERT INTO roles(book_id, name, role_type, profile, is_protagonist) VALUES(?,?,?,?,?)")
+      .bind(p.id, String(b.name).trim(), b.role_type || "角色", b.profile || "", b.is_protagonist ? 1 : 0).run();
+    let id = Number(r.meta?.last_rowid);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM roles").first())?.m ?? 0);
+    return json({ id });
+  },
+  "PATCH /api/roles/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const own = await env.DB.prepare("SELECT r.id FROM roles r JOIN books b ON r.book_id=b.id WHERE r.id=? AND b.owner_email=?").bind(p.id, email).first();
+    if (!own) return json({ error: "not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    await env.DB.prepare(
+      "UPDATE roles SET name=COALESCE(?,name), role_type=COALESCE(?,role_type), profile=COALESCE(?,profile), is_protagonist=COALESCE(?,is_protagonist), state_note=COALESCE(?,state_note) WHERE id=?"
+    ).bind(b.name ?? null, b.role_type ?? null, b.profile ?? null, b.is_protagonist === undefined ? null : (b.is_protagonist ? 1 : 0), b.state_note ?? null, p.id).run();
+    return json({ ok: true });
+  },
+  "DELETE /api/roles/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const own = await env.DB.prepare("SELECT r.id FROM roles r JOIN books b ON r.book_id=b.id WHERE r.id=? AND b.owner_email=?").bind(p.id, email).first();
+    if (!own) return json({ error: "not found" }, 404);
+    await env.DB.prepare("DELETE FROM roles WHERE id=?").bind(p.id).run();
+    return json({ ok: true });
+  },
+
+  // ---- 伏笔（open_loop）----
+  "POST /api/books/:id/loops": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    if (!b.content || !String(b.content).trim()) return json({ error: "伏笔内容必填" }, 400);
+    const r = await env.DB.prepare("INSERT INTO foreshadows(book_id, content, urgency, planted_chapter) VALUES(?,?,?,?)")
+      .bind(p.id, String(b.content).trim(), Math.min(100, Math.max(0, Number(b.urgency) ?? 50)), Number(b.planted_chapter) || 0).run();
+    let id = Number(r.meta?.last_rowid);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM foreshadows").first())?.m ?? 0);
+    return json({ id });
+  },
+  "PATCH /api/loops/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const own = await env.DB.prepare("SELECT f.id FROM foreshadows f JOIN books b ON f.book_id=b.id WHERE f.id=? AND b.owner_email=?").bind(p.id, email).first();
+    if (!own) return json({ error: "not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    await env.DB.prepare(
+      "UPDATE foreshadows SET content=COALESCE(?,content), status=COALESCE(?,status), urgency=COALESCE(?,urgency), payoff_chapter=COALESCE(?,payoff_chapter) WHERE id=?"
+    ).bind(b.content ?? null, b.status ?? null, b.urgency === undefined ? null : Number(b.urgency), b.payoff_chapter === undefined ? null : Number(b.payoff_chapter), p.id).run();
+    return json({ ok: true });
+  },
+  "DELETE /api/loops/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const own = await env.DB.prepare("SELECT f.id FROM foreshadows f JOIN books b ON f.book_id=b.id WHERE f.id=? AND b.owner_email=?").bind(p.id, email).first();
+    if (!own) return json({ error: "not found" }, 404);
+    await env.DB.prepare("DELETE FROM foreshadows WHERE id=?").bind(p.id).run();
+    return json({ ok: true });
+  },
+
+  // ---- 大纲（章纲 = 法律）----
+  "POST /api/books/:id/outline": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    if (!b.title || !String(b.title).trim()) return json({ error: "标题必填" }, 400);
+    // 支持批量：b.items = [{title, detail}]
+    if (Array.isArray(b.items) && b.items.length) {
+      const maxRow = await env.DB.prepare("SELECT MAX(seq) AS m FROM outline_items WHERE book_id=?").bind(p.id).first();
+      let seq = Number(maxRow?.m) || 0;
+      for (const it of b.items) {
+        if (!it.title) continue;
+        seq++;
+        await env.DB.prepare("INSERT INTO outline_items(book_id, seq, title, detail) VALUES(?,?,?,?)")
+          .bind(p.id, seq, String(it.title).trim(), it.detail || "").run();
+      }
+      return json({ ok: true, added: b.items.length });
+    }
+    const r = await env.DB.prepare("INSERT INTO outline_items(book_id, seq, title, detail) VALUES(?,?,?,?)")
+      .bind(p.id, Number(b.seq) || 1, String(b.title).trim(), b.detail || "").run();
+    let id = Number(r.meta?.last_rowid);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM outline_items").first())?.m ?? 0);
+    return json({ id });
+  },
+  "PATCH /api/outline/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const own = await env.DB.prepare("SELECT o.id FROM outline_items o JOIN books b ON o.book_id=b.id WHERE o.id=? AND b.owner_email=?").bind(p.id, email).first();
+    if (!own) return json({ error: "not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    await env.DB.prepare(
+      "UPDATE outline_items SET title=COALESCE(?,title), detail=COALESCE(?,detail), status=COALESCE(?,status) WHERE id=?"
+    ).bind(b.title ?? null, b.detail ?? null, b.status ?? null, p.id).run();
+    return json({ ok: true });
+  },
+  "DELETE /api/outline/:id": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const own = await env.DB.prepare("SELECT o.id FROM outline_items o JOIN books b ON o.book_id=b.id WHERE o.id=? AND b.owner_email=?").bind(p.id, email).first();
+    if (!own) return json({ error: "not found" }, 404);
+    await env.DB.prepare("DELETE FROM outline_items WHERE id=?").bind(p.id).run();
+    return json({ ok: true });
+  },
+
+  // ---- 事件流（只读，长期记忆）----
+  "GET /api/books/:id/events": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
+    const res = await env.DB.prepare("SELECT * FROM chapter_events WHERE book_id=? ORDER BY chapter_seq DESC, id DESC LIMIT 100").bind(p.id).all();
+    return json(res.results ?? []);
+  },
+
+  // ---- 流水线（6 步链路：任务书→起草→审查→润色→提取→回写）----
+  "POST /api/books/:id/pipeline": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const book = await bookOrNone(env, p, email);
+    if (!book) return json({ error: "book not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    const maxRow = await env.DB.prepare("SELECT MAX(seq) AS m FROM chapters WHERE book_id=?").bind(p.id).first();
+    const target = {
+      seq: Number(b.seq) || ((maxRow?.m || 0) + 1),
+      title: b.title || "",
+      words: Number(b.words) || 2000,
+      mode: ["standard", "fast", "minimal"].includes(b.mode) ? b.mode : "standard",
+      outlineSeq: b.outlineSeq ? Number(b.outlineSeq) : 0,
+      outline_note: b.outline_note || "",
+    };
+    const t = Date.now();
+    let result;
+    try {
+      result = await runPipeline(env, email, book, target);
+      await logUsage(env, email, `pipeline:${target.mode}`, true);
+    } catch (e) {
+      await logUsage(env, email, `pipeline:${target.mode}`, false);
+      return json({ error: String(e.message || e), seq: target.seq }, 500);
+    }
+    return json(result);
   },
 
   // ---- 每用户 LLM 设置 ----
@@ -230,7 +740,7 @@ const api = {
     return json({ ok: true });
   },
 
-  // ---- AI 动作（走该用户自己的 LLM 配置） ----
+  // ---- 便捷 AI 动作（旧版兼容 + 大纲生成入库）----
   "POST /api/ai/outline": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
     const s = await getLlm(env, email);
@@ -238,11 +748,24 @@ const api = {
     const book = await env.DB.prepare("SELECT * FROM books WHERE id=? AND owner_email=?").bind(bookId, email).first();
     if (!book) return json({ error: "book not found" }, 404);
     const msgs = [
-      { role: "system", content: "你是网文策划。根据梗概输出章节大纲：每行一个章节，格式：N、章节标题（30-60字，含本章主要事件与钩子）。只输出大纲正文。" },
-      { role: "user", content: `【故事梗概】${book.logline || "（未填写）"}\n【世界观】${book.world_setting || "（未填写）"}\n【主要角色】${book.characters || "（未填写）"}\n\n请生成 ${count} 章大纲。${extra ? `\n额外要求：${extra}` : ""}` },
+      { role: "system", content: "你是网文策划。根据梗概输出章节大纲：每行一个章节，格式：N、章节标题｜本章要点。只输出大纲正文。" },
+      { role: "user", content: `【故事梗概】${book.logline || "（未填写）"}\n【世界观】${book.world_setting || "（未填写）"}\n【主要角色】${(book.characters || "")}\n\n请生成 ${count} 章大纲。${extra ? `\n额外要求：${extra}` : ""}` },
     ];
-    const out = await chat(env, s, msgs, { maxTokens: 3000, temperature: 0.9 });
-    return json({ text: out });
+    let out = "";
+    try { out = await chat(env, s, msgs, { maxTokens: 3000, temperature: 0.9 }); await logUsage(env, email, "ai:outline", true); }
+    catch (e) { await logUsage(env, email, "ai:outline", false); throw e; }
+    // 大纲生成后自动入库为 outline_items（可写：b.save=true）
+    let added = 0;
+    if (bookId && (await req.json().catch(() => ({}))).save) {
+      const lines = out.split("\n").map((l) => l.replace(/^\s*\d+[、.．,，]\s*/, "").trim()).filter((l) => l.length >= 2);
+      for (const line of lines.slice(0, count)) {
+        const [t, d] = line.split("｜").map((x) => x.trim());
+        await env.DB.prepare("INSERT INTO outline_items(book_id, seq, title, detail) VALUES(?,?,?,?)")
+          .bind(bookId, (await env.DB.prepare("SELECT COALESCE(MAX(seq),0)+1 AS s FROM outline_items WHERE book_id=?").bind(bookId).first()).s, t, d || "").run();
+        added++;
+      }
+    }
+    return json({ text: out, added });
   },
   "POST /api/ai/expand-setting": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
@@ -261,204 +784,291 @@ const api = {
     else await env.DB.prepare("UPDATE books SET characters=?, updated_at=datetime('now') WHERE id=?").bind(out, book.id).run();
     return json({ text: out });
   },
-  "POST /api/ai/write": async (env, req, p, email) => {
-    if (!email) return json({ error: "unauthorized" }, 401);
-    const s = await getLlm(env, email);
-    const body = await req.json().catch(() => ({}));
-    const book = await env.DB.prepare("SELECT * FROM books WHERE id=? AND owner_email=?").bind(body.bookId, email).first();
-    if (!book) return json({ error: "book not found" }, 404);
-    const { chapterId, action = "continue", extra = "", words = 2000 } = body;
-    const chapter = await env.DB.prepare("SELECT c.* FROM chapters c JOIN books b ON c.book_id=b.id WHERE c.id=? AND b.owner_email=?").bind(chapterId, email).first();
-    if (!chapter) return json({ error: "chapter not found" }, 404);
-    const taskMap = {
-      continue: `续写第${chapter.seq}章正文，约${words}字，保持节奏与钩子，章末留悬念。`,
-      rewrite: `重写第${chapter.seq}章正文，约${words}字。${extra}`,
-      polish: `润色第${chapter.seq}章现有正文：修正语病、统一口吻、增强画面感，保持情节不变，输出完整润色后正文。`,
-      summarize: `用150-300字总结第${chapter.seq}章的要点（事件、人物变化、伏笔），用于后续章节前情。`,
-      hook: `基于第${chapter.seq}章结尾，写3个备选下章开场钩子（各约100字）。`,
-    };
-    const msgs = await buildContextPrompt(env, book, chapter, taskMap[action] || taskMap.continue + (extra ? `。额外要求：${extra}` : ""));
-    const out = await chat(env, s, msgs, { maxTokens: 4000, temperature: action === "polish" ? 0.4 : 0.9 });
-    if (action === "summarize") await env.DB.prepare("UPDATE chapters SET summary=?, ai_kind='summarize', updated_at=datetime('now') WHERE id=?").bind(out, chapterId).run();
-    return json({ text: out });
-  },
-};
+});
 
-// ---------- 前端 ----------
+// ---------- 前端（统一 UI：三端响应式 + 昼夜主题 + 角色/伏笔/大纲管理 + 流水线 + 管理端） ----------
 const HTML = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>NVS 写作台</title>
 <style>
-:root{--bg:#111418;--panel:#1a1f26;--line:#2a313b;--tx:#d7dde5;--mut:#8b95a3;--acc:#4da3ff}
+:root{--bg:#111418;--panel:#1a1f26;--panel2:#212832;--line:#2a313b;--tx:#d7dde5;--mut:#8b95a3;--acc:#4da3ff;--ok:#3fb96f;--warn:#e0b341;--bad:#e05d5d}
+[data-theme="day"]{--bg:#f5f6f8;--panel:#ffffff;--panel2:#eef0f4;--line:#d8dce2;--tx:#1c222b;--mut:#5d6675;--acc:#2064d8;--ok:#1f8a4c;--warn:#a8791a;--bad:#c03838}
 *{box-sizing:border-box}body{margin:0;font:14px/1.7 -apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif;background:var(--bg);color:var(--tx)}
-#app{display:grid;grid-template-columns:320px 1fr;height:100vh}
-aside{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
-main{display:flex;flex-direction:column;min-width:0}
-h1{font-size:16px;padding:14px 16px;margin:0;border-bottom:1px solid var(--line)}
-h1 span{color:var(--acc)}
-.bk-list,.ch-list{flex:1;overflow:auto}
-.item{padding:10px 16px;border-bottom:1px solid var(--line);cursor:pointer}
-.item:hover{background:#20262e}
-.item b{display:block;font-size:14px}
-.item small{color:var(--mut)}
-button{background:var(--acc);border:0;color:#fff;border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
-button.ghost{background:transparent;border:1px solid var(--line);color:var(--tx)}
-button.small{padding:3px 8px;font-size:12px}
-input,textarea,select{width:100%;background:#11151a;border:1px solid var(--line);color:var(--tx);border-radius:6px;padding:8px;font:inherit}
-textarea{resize:vertical}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-#topbar{display:flex;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-#editor{flex:1;margin:0 auto;width:min(860px,100%);padding:20px}
-#aiout{white-space:pre-wrap;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px;min-height:60px;max-height:50vh;overflow:auto}
-.tag{font-size:11px;color:var(--mut)}
-.err{color:#ff7b72}
-#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:10}
-#login .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:28px;width:340px}
-#login .box h2{margin:0 0 14px;font-size:18px}
-#login .box input{margin-top:8px}
-#login .box button{width:100%;margin-top:14px;padding:9px}
-#login .swap{margin-top:10px;font-size:12px;color:var(--mut);text-align:center}
-#login .swap a{color:var(--acc);cursor:pointer}
-#mebox{padding:10px 16px;border-bottom:1px solid var(--line);font-size:12px;color:var(--mut);display:flex;justify-content:space-between;align-items:center}
-#settings{max-width:520px;padding:20px}
-</style></head><body>
-<div id="login"><div class="box">
- <h2><span style="color:var(--acc)">NVS</span> 写作台</h2>
- <div id="loginmsg"></div>
- <input id="li_email" type="email" placeholder="邮箱">
- <input id="li_pass" type="password" placeholder="密码（至少6位）">
- <button id="li_btn">登 录</button>
- <div class="swap" id="li_swap">没有账号？<a id="li_to_reg">注册</a></div>
-</div></div>
-<div id="app" style="visibility:hidden">
-<aside>
- <h1><span>NVS</span> 写作台</h1>
- <div id="mebox"><span id="me"></span><button class="ghost small" id="logout">退出</button></div>
- <div style="padding:10px 16px" class="row"><button id="newbook">+ 新建书</button><button class="ghost small" id="cfg">设置</button></div>
- <div class="bk-list" id="books"></div>
- <div class="ch-list" id="chapters"></div>
+#app{display:grid;grid-template-columns:300px 1fr;grid-template-rows:auto 1fr;height:100vh}
+header{grid-column:1/3;background:var(--panel);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;padding:10px 16px}
+header h1{font-size:16px;margin:0;flex:1}header .mut{color:var(--mut);font-size:12px}
+aside{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:12px}
+main{overflow-y:auto;padding:16px}
+button{background:var(--panel2);border:1px solid var(--line);color:var(--tx);border-radius:6px;padding:6px 12px;cursor:pointer;font:inherit}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button.danger{border-color:var(--bad);color:var(--bad)}
+input,textarea,select{background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:6px;padding:7px 9px;font:inherit;width:100%}
+label{color:var(--mut);font-size:12px;display:block;margin:10px 0 4px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:12px}
+.card h3{margin:0 0 8px;font-size:14px}
+.chips span{display:inline-block;border:1px solid var(--line);border-radius:12px;padding:2px 10px;margin:2px 4px 2px 0;font-size:12px}
+.badge{font-size:11px;padding:1px 8px;border-radius:8px;background:var(--panel2);color:var(--mut)}
+.badge.ok{color:var(--ok);border:1px solid var(--ok)}.badge.bad{color:var(--bad);border:1px solid var(--bad)}.badge.warn{color:var(--warn);border:1px solid var(--warn)}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)}
+.thumbs{color:var(--mut);font-size:12px}.tabbar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.tabbar button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-radius:8px;padding:10px;font-size:13px}
+.muted{color:var(--mut)}.small{font-size:12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.progress{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin:6px 0}.progress i{display:block;height:100%;background:var(--acc);transition:width .3s}
+#stageList div{padding:3px 0}
+@media(max-width:1100px){#app{grid-template-columns:260px 1fr}}
+@media(max-width:820px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr}aside{border-right:none;border-bottom:1px solid var(--line);max-height:280px}#mobileBooks{display:block}}
+@media(max-width:520px){main{padding:10px}header .mut{display:none}}
+</style></head><body><div id="app">
+<header>
+  <h1 id="siteName">NVS 写作台</h1>
+  <span class="mut" id="who"></span>
+  <button id="btnTheme" title="昼夜切换">◐</button>
+  <button id="btnAdmin" style="display:none">管理</button>
+  <button id="btnOut">退出</button>
+</header>
+<aside><div id="mobileBooks"></div>
+  <div id="authPane">
+    <button class="primary" id="btnLoginGo" style="width:100%;margin-bottom:8px">登录 / 注册</button>
+    <div class="card"><h3>登录</h3>
+      <label>邮箱</label><input id="liEmail"><label>密码</label><input id="liPass" type="password">
+      <div class="row"><button class="primary" id="btnLogin">登录</button><button id="btnReg">注册（需注册码）</button></div>
+      <label>注册码</label><input id="liInvite" placeholder="NV-XXXX">
+      <div id="authMsg" class="muted small"></div>
+    </div>
+  </div>
+  <div id="dataPane" style="display:none">
+    <div class="row"><button class="primary" id="btnNewBook">＋ 新建书</button></div>
+    <div id="bookList"></div>
+  </div>
 </aside>
 <main>
- <div id="topbar"><select id="act" style="width:170px">
-  <option value="continue">AI 续写</option><option value="rewrite">AI 重写</option><option value="polish">AI 润色</option>
-  <option value="summarize">AI 摘要(存前情)</option><option value="hook">AI 下章钩子×3</option>
-  <option value="outline">生成章节大纲</option><option value="world">扩展世界观</option><option value="chars">扩展角色设定</option></select>
- <input id="extra" placeholder="额外要求（可选）" style="flex:1;min-width:180px">
- <button id="go">生成</button><button class="ghost" id="copy">复制</button></div>
- <div id="editor"><textarea id="content" placeholder="在此书写……（AI 生成结果可点击“复制”填入）" rows="20"></textarea></div>
- <div style="padding:0 16px 16px" id="aiwrap" hidden>
-  <div class="row" style="justify-content:space-between"><b>AI 输出</b><span class="tag" id="aistatus"></span></div>
-  <div id="aiout"></div>
- </div>
- <div id="settings" hidden>
-  <b>LLM 设置（仅此账号生效）</b>
-  <div style="margin-top:10px"><label class="tag">提供商</label><select id="s_provider" style="width:auto">
-   <option value="openai">OpenAI 兼容（OpenRouter/Groq/DeepSeek/Moonshot/Ollama/vLLM…）</option>
-   <option value="cf-ai">Cloudflare Workers AI（免费额度，模型如 @cf/meta/llama-3.1-8b-instruct）</option></select></div>
-  <div style="margin-top:8px"><label class="tag">Base URL（OpenAI 兼容端点）</label><input id="s_base" value="https://openrouter.ai/api/v1"></div>
-  <div style="margin-top:8px"><label class="tag">模型</label><input id="s_model"></div>
-  <div style="margin-top:8px"><label class="tag">API Key</label><input id="s_key" type="password" placeholder="sk-…"></div>
-  <div class="row" style="margin-top:12px"><button id="savecfg">保存</button><span id="cfgmsg" class="tag"></span><span id="s_note" class="tag" style="margin-left:8px"></span></div>
- </div>
-</div></div>
+  <div id="view" class="muted">先登录，再新建或选择一本书。</div>
+</main>
+</div>
 <script>
-let token=localStorage.getItem('nvs_token')||'';
-const $=id=>document.getElementById(id);
-const H=()=>({'Content-Type':'application/json','Authorization':'Bearer '+token});
-async function api(method,url,body){const r=await fetch(url,{method,headers:H(),body:body?JSON.stringify(body):undefined});
- const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d}
-let cur={book:null,ch:null};
-
-// ---- 登录 / 注册 ----
-let regMode=false;
-function setReg(on){regMode=on;$('li_btn').textContent=on?'注 册':'登 录';$('li_swap').innerHTML=on?'已有账号？<a id="li_to_login">登录</a>':'没有账号？<a id="li_to_reg">注册</a>';(on?$('li_to_login'):$('li_to_reg')).onclick=()=>setReg(!on)}
-$('li_to_reg').onclick=()=>setReg(true);
-async function submitAuth(){
- const email=$('li_email').value.trim(),pass=$('li_pass').value;
- $('loginmsg').textContent='';$('loginmsg').className='tag';
- try{const r=await api(regMode?'POST':'POST',regMode?'/api/register':'/api/login',{email,password:pass});
-  token=r.token;localStorage.setItem('nvs_token',token);enterApp(r.email);
- }catch(e){$('loginmsg').textContent=e.message;$('loginmsg').className='err'}
+let TK=localStorage.getItem('nvs_token')||'', EMAIL=localStorage.getItem('nvs_email')||'', ADMIN=null, BK=null, TAB='chapters';
+const $=s=>document.querySelector(s);
+function toast(m,t){const d=document.createElement('div');d.className='card '+(t==='bad'?'':'');d.style.animation='none';d.innerHTML=m;$('#view').prepend(d);setTimeout(()=>d.remove(),4000);}
+async function api(path,opt={}){
+  const r=await fetch(path,{method:opt.method||'GET',headers:{'Content-Type':'application/json',...(TK?{Authorization:'Bearer '+TK}:{})},body:opt.body?JSON.stringify(opt.body):undefined});
+  let b;try{b=await r.json()}catch{b={}}
+  if(!r.ok){const e=b.error||('HTTP '+r.status);const err=new Error(e);err.data=b;if(b.code_required)err.codeRequired=true;throw err}
+  return b;
 }
-$('li_btn').onclick=submitAuth;$('li_pass').onkeydown=e=>{if(e.key==='Enter')submitAuth()};
+function save(){localStorage.setItem('nvs_token',TK);localStorage.setItem('nvs_email',EMAIL)}
+function logout(){TK='';EMAIL='';ADMIN=null;BK=null;localStorage.clear();location.reload()}
 
-function enterApp(email){$('login').style.display='none';$('app').style.visibility='visible';$('me').textContent=email;}
-$('logout').onclick=()=>{localStorage.removeItem('nvs_token');token='';location.reload()};
+// ---- 昼夜主题 ----
+function setTheme(t){document.documentElement.setAttribute('data-theme',t);localStorage.setItem('nvs_theme',t)}
+setTheme(localStorage.getItem('nvs_theme')||'night');
+$('#btnTheme').onclick=()=>setTheme(document.documentElement.getAttribute('data-theme')==='day'?'night':'day');
 
-// ---- 书籍 ----
+// ---- 认证 ----
+async function afterLogin(){
+  const me=await api('/api/me').catch(()=>({}));EMAIL=me.email||EMAIL;save();
+  if(me.site_name)$('#siteName').textContent=me.site_name;
+  if(me.announcement)toast('<b>公告</b><br>'+me.announcement);
+  $('#authPane').style.display='none';$('#dataPane').style.display='';$('#who').textContent=EMAIL;
+  await loadBooks();
+}
+$('#btnLogin').onclick=async()=>{try{const b=await api('/api/login',{method:'POST',body:{email:$('#liEmail').value,password:$('#liPass').value}});TK=b.token;EMAIL=b.email;save();await afterLogin()}catch(e){$('#authMsg').textContent=e.message}};
+$('#btnReg').onclick=async()=>{try{const b=await api('/api/register',{method:'POST',body:{email:$('#liEmail').value,password:$('#liPass').value,invite:$('#liInvite').value}});TK=b.token;EMAIL=b.email;save();await afterLogin()}catch(e){$('#authMsg').textContent=e.message}};
+$('#btnLoginGo').onclick=()=>{$('#authPane').style.display='';$('#dataPane').style.display='none'};
+$('#btnOut').onclick=logout;
+
 async function loadBooks(){
- try{const bs=await api('GET','/api/books')}catch(e){if(String(e).includes('401')||/unauthorized/i.test(e.message))return doLogout();return}
- $('books').innerHTML=(bs||[]).map(b=>\`<div class="item" data-b="\${b.id}"><b>\${b.title}</b><small>\${b.chapter_count||0} 章 · \${b.genre||'-'}</small></div>\`).join('')||'<div class="tag" style="padding:10px 16px">还没有书</div>';
- document.querySelectorAll('#books .item').forEach(el=>el.onclick=()=>openBook(el.dataset.b));
+  const books=await api('/api/books');
+  const mk=bs=>{const el=document.createElement('div');el.className='card';el.innerHTML=\`<b>\${bs.title}</b> <span class="badge">\${bs.chapter_count} 章</span>\`;el.onclick=()=>openBook(bs.id,bs.title);return el}
+  const c=$('#bookList');c.innerHTML='';books.forEach(b=>c.appendChild(mk(b)));
+  const m=$('#mobileBooks');m.innerHTML='';books.forEach(b=>{const el=document.createElement('button');el.className='on';el.textContent=b.title;el.style.cssText='display:block;width:100%;text-align:left;margin:4px 0';el.onclick=()=>openBook(b.id,b.title);m.appendChild(el)});
+  return books;
 }
-function doLogout(){localStorage.removeItem('nvs_token');$('app').style.visibility='hidden';$('login').style.display='flex'}
-async function openBook(id){
- const bs=await api('GET','/api/books');const b=bs.find(x=>x.id==id);cur.book=id;
- const chs=await api('GET','/api/books/'+id+'/chapters');
- $('chapters').innerHTML=chs.map(c=>\`<div class="item" data-c="\${c.id}"><b>第\${c.seq}章 \${c.title}</b><small class="tag">\${c.ai_kind?'AI·'+c.ai_kind:''} \${c.updated_at||''}</small></div>\`).join('')||'';
- document.querySelectorAll('#chapters .item').forEach(el=>el.onclick=()=>openCh(el.dataset.c));
- if(chs[0])openCh(chs[0].id);else newChapter();
-}
-async function newChapter(){const r=await api('POST','/api/books/'+cur.book+'/chapters');openCh(r.id)}
-async function openCh(id){
- cur.ch=id;const c=await api('GET','/api/chapters/'+id);
- $('content').value=c.content;$('chapters').querySelectorAll('.item').forEach(el=>el.style.background=el.dataset.c==id?'#20262e':'');
-}
-$('newbook').onclick=()=>{const t=prompt('书名');if(!t)return;const g=prompt('类型（如：都市/玄幻/科幻/悬疑）','都市')||'';const lg=prompt('一句话梗概（可选）')||'';
- api('POST','/api/books',{title:t,genre:g,logline:lg}).then(r=>{loadBooks();openBook(r.id)})};
+$('#btnNewBook').onclick=async()=>{const t=prompt('书名：');if(!t)return;const g=prompt('题材（武侠/都市/科幻…）：')||'';const l=prompt('一句话梗概：')||'';const b=await api('/api/books',{method:'POST',body:{title:t,genre:g,logline:l}});toast('已创建书 #'+b.id);await loadBooks();openBook(b.id,t)};
 
-// ---- AI ----
-async function gen(){
- const a=$('act').value,extra=$('extra').value;
- if(a==='outline'||a==='world'||a==='chars'){if(!cur.book)return alert('先建一本书');
-  $('aiwrap').hidden=false;$('aistatus').textContent='生成中…';$('aiout').textContent='';
-  try{const endpoint=a==='outline'?'/api/ai/outline':'/api/ai/expand-setting';
-   const r=await api('POST',endpoint,{bookId:cur.book,extra,kind:a==='chars'?'chars':'world'});
-   $('aiout').textContent=r.text+(a!=='outline'?'\\n\\n（已保存进设定）':'');$('aistatus').textContent='完成';
-  }catch(e){$('aiout').textContent=e.message;$('aistatus').textContent='失败'}return}
- if(!cur.ch)return alert('先选一章');
- $('aiwrap').hidden=false;$('aistatus').textContent='生成中…';$('aiout').textContent='';
- try{const r=await api('POST','/api/ai/write',{bookId:cur.book,chapterId:cur.ch,action:a,extra});
-  $('aiout').textContent=r.text;$('aistatus').textContent='完成';
-  await api('PATCH','/api/chapters/'+cur.ch,{ai_kind:a});
- }catch(e){$('aiout').textContent=e.message;$('aistatus').textContent='失败'}
+// ---- 主视图 ----
+async function openBook(id,title){
+  BK=id;TAB='chapters';
+  const d=await api('/api/books/'+id);
+  const main=$('#view');
+  main.innerHTML=\`
+  <div class="card"><b>\${d.book.title}</b> <span class="badge">\${d.book.genre||'未分题材'}</span>
+    <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vOutline">生成大纲</button><button id="vExpand">扩设定</button></div>
+    <div class="small muted">三大定律：大纲即法律 · 设定即物理 · 上章钩子必须回应</div>
+  </div>
+  <div class="tabbar">
+    \${['chapters:章节','roles:角色','loops:伏笔','outline:大纲','events:事件流'].map(t=>{const k=t.split(':');return \`<button data-tab="\${k[0]}" class="tb \${k[0]===TAB?'on':''}">\${k[1]}</button>\`}).join('')}
+  </div>
+  <div id="tabBody"></div>
+  <div id="pipePanel" style="display:none"></div>\`;
+  main.querySelectorAll('.tb').forEach(b=>b.onclick=()=>{TAB=b.dataset.tab;main.querySelectorAll('.tb').forEach(x=>x.classList.toggle('on',x===b));renderTab()});
+  $('#vPipe').onclick=()=>runPipe('standard');$('#vPipeFast').onclick=()=>runPipe('fast');$('#vPipeMin').onclick=()=>runPipe('minimal');
+  $('#vOutline').onclick=genOutline;$('#vExpand').onclick=expandSetting;
+  await renderTab();
 }
-$('go').onclick=gen;
-$('copy').onclick=()=>$('aiout').textContent&&navigator.clipboard.writeText($('aiout').textContent);
+function renderTab(){return TAB==='chapters'?tabChapters():TAB==='roles'?tabRoles():TAB==='loops'?tabLoops():TAB==='outline'?tabOutline():tabEvents()}
 
-// ---- 设置（当前用户的 LLM） ----
-$('cfg').onclick=()=>$('settings').hidden=!$('settings').hidden;
-(async()=>{try{const s=await api('GET','/api/settings');
- if(s.provider)$('s_provider').value=s.provider;if(s.base_url)$('s_base').value=s.base_url;if(s.model)$('s_model').value=s.model;
- $('s_note').textContent='Key: '+(s.has_key?'已配置':'未配置')}catch(e){}})();
-$('savecfg').onclick=async()=>{
- try{await api('POST','/api/settings',{provider:$('s_provider').value,base_url:$('s_base').value,model:$('s_model').value,api_key:$('s_key').value});
-  $('cfgmsg').textContent='已保存';$('cfgmsg').className='tag';$('s_note').textContent='Key: 已配置'}catch(e){$('cfgmsg').textContent=e.message;$('cfgmsg').className='err'}}
-// 自动保存正文（防抖）
-let t;$('content').oninput=()=>{clearTimeout(t);t=setTimeout(()=>cur.ch&&api('PATCH','/api/chapters/'+cur.ch,{content:$('content').value}).catch(()=>{}),1500)};
+async function tabChapters(){
+  const cs=await api(\`/api/books/\${BK}/chapters\`);
+  $('#tabBody').innerHTML=\`<div class="card"><b>共 \${cs.length} 章</b>（committed=已通过审查回写，rejected=有阻断待处理）
+    <div id="chList"></div>
+    <div class="row"><input id="chNew" placeholder="手动新章标题（可选，不填走流水线）" style="flex:1"><button class="primary" id="chNewBtn">＋ 空白章</button></div>
+  </div>\`;
+  const list=$('#chList');
+  list.innerHTML=cs.length?'<table><tr><th>#</th><th>标题</th><th>状态</th><th>摘要/钩子</th><th></th></tr>'+cs.map(c=>\`
+    <tr data-id="\${c.id}"><td>\${c.seq}</td><td>\${c.title||''}</td>
+    <td><span class="badge \${c.status==='committed'?'ok':c.status==='rejected'?'bad':'warn'}">\${c.status||'draft'}</span></td>
+    <td class="small muted">\${(c.summary||'').slice(0,50)}\${c.hook?'<br>钩：'+(c.hook||'').slice(0,40):''}</td>
+    <td><button class="ev" data-id="\${c.id}">读</button> <button class="del" data-id="\${c.id}">删</button></td></tr>\`).join('')+'</table>':'<div class="muted">尚无章节。点「⚡ 一键写下一章」启动 6 步流水线。</div>';
+  list.querySelectorAll('.ev').forEach(b=>b.onclick=async()=>{const r=await api('/api/chapters/'+b.dataset.id);toast(\`<b>第\${r.seq}章 \${r.title}</b><br><pre>\${r.content||'(空)'}</pre>\${r.review_json?'<b>审查</b><pre>'+JSON.stringify(JSON.parse(r.review_json),null,1).slice(0,600)+'</pre>':''}\`)});
+  list.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{if(!confirm('删除此章？'))return;await api('/api/chapters/'+b.dataset.id,{method:'DELETE'});tabChapters()});
+  $('#chNewBtn').onclick=async()=>{const t=$('#chNew').value;const r=await api(\`/api/books/\${BK}/chapters\`,{method:'POST',body:{}});toast('已创建空白章 #'+r.id+'（可手动填写后跑流水线）');tabChapters()};
+}
 
-// ---- 启动：有 token 直接进，没有先验一次 ----
-(async()=>{
- if(!token)return; // 显示登录
- try{await api('GET','/api/books');enterApp(localStorage.getItem('nvs_email')||'');loadBooks()}
- catch(e){if(/unauthorized/i.test(e.message)||String(e).includes('401')){doLogout()}else{enterApp('');loadBooks()}}
+async function tabRoles(){
+  const d=await api('/api/books/'+BK);
+  $('#tabBody').innerHTML=\`<div class="card"><b>角色设定集</b>（主角优先；state_note 随流水线自动回写）
+    <div class="row"><input id="rName" placeholder="角色名" style="width:140px"><select id="rType"><option>角色</option><option>组织</option><option>地点</option><option>物品</option><option>势力</option></select>
+    <label class="small" style="display:inline"><input type="checkbox" id="rProto"> 主角</label><button class="primary" id="rAdd">＋</button></div>
+    \${d.roles.map(r=>\`<div class="row"><b>\${r.name}</b> <span class="badge">\${r.role_type}</span>\${r.is_protagonist?' <span class="badge ok">主角</span>':''}
+      <span class="muted small">\${r.profile||''}</span>\${r.state_note?\` <span class="badge warn">状态：\${r.state_note}</span>\`:''}
+      <button class="rm" data-id="\${r.id}">删</button></div>\`).join('')}
+  </div>\`;
+  $('#rAdd').onclick=async()=>{await api(\`/api/books/\${BK}/roles\`,{method:'POST',body:{name:$('#rName').value,type:$('#rType').value,role_type:$('#rType').value,profile:'',is_protagonist:$('#rProto').checked}});tabRoles()};
+  document.querySelectorAll('.rm').forEach(b=>b.onclick=async()=>{await api('/api/roles/'+b.dataset.id,{method:'DELETE'});tabRoles()});
+}
+
+async function tabLoops(){
+  const d=await api('/api/books/'+BK);
+  const urgent=d.loops.filter(l=>l.status==='open'&&l.urgency>=80);
+  $('#tabBody').innerHTML=\`<div class="card"><b>伏笔（open_loop）</b> \${urgent.length?\`<span class="badge bad">\${urgent.length} 条紧急，将强制进入下一章任务书</span>\`:''}
+    <div class="row"><input id="fContent" placeholder="新伏笔" style="flex:1"><input id="fUrg" type="number" min="0" max="100" value="50" title="紧急度 0-100" style="width:70px"><button class="primary" id="fAdd">＋ 埋设</button></div>
+    \${d.loops.map(l=>\`<div class="row"><span class="badge \${l.status==='paid'?'ok':'warn'}">\${l.status==='paid'?'已回收':'未回收'}</span>
+      <span class="small">\${l.content}</span><span class="muted small">埋@\${l.planted_chapter||'?'}</span>
+      \${l.status==='open'?\`<button class="pay" data-id="\${l.id}" title="标记已回收">✓</button> <button class="del" data-id="\${l.id}">删</button>\`:''}</div>\`).join('')}
+  </div>\`;
+  $('#fAdd').onclick=async()=>{await api(\`/api/books/\${BK}/loops\`,{method:'POST',body:{content:$('#fContent').value,urgency:+$('#fUrg').value}});tabLoops()};
+  document.querySelectorAll('.pay').forEach(b=>b.onclick=async()=>{await api('/api/loops/'+b.dataset.id,{method:'PATCH',body:{status:'paid'}});tabLoops()});
+  document.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{await api('/api/loops/'+b.dataset.id,{method:'DELETE'});tabLoops()});
+}
+
+async function tabOutline(){
+  const d=await api('/api/books/'+BK);
+  $('#tabBody').innerHTML=\`<div class="card"><b>大纲（法律）</b>
+    <div class="row"><input id="oTitle" placeholder="章纲标题" style="flex:1"><input id="oDetail" placeholder="本章要点/禁区（可选）" style="flex:1"><button class="primary" id="oAdd">＋</button></div>
+    \${d.outline.map(o=>\`<div class="row"><span class="badge">\${o.status}</span> <b>\${o.seq}、\${o.title}</b> \${o.detail?\`<span class="muted small">\${o.detail}</span>\`:''}
+      \${o.status!=='done'?\`<button class="adv" data-id="\${o.id}">推进</button>\`:''} <button class="del" data-id="\${o.id}">删</button></div>\`).join('')||'<div class="muted">无大纲。点「生成大纲」用 AI 出章纲并入库。</div>'}
+  </div>\`;
+  $('#oAdd').onclick=async()=>{await api(\`/api/books/\${BK}/outline\`,{method:'POST',body:{title:$('#oTitle').value,detail:$('#oDetail').value}});tabOutline()};
+  document.querySelectorAll('.adv').forEach(b=>b.onclick=async()=>{const cur=await api('/api/books/'+BK);const o=cur.outline.find(x=>x.id==b.dataset.id);await api('/api/outline/'+b.dataset.id,{method:'PATCH',body:{status:o.status==='pending'?'in_progress':'done'}});tabOutline()});
+  document.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{await api('/api/outline/'+b.dataset.id,{method:'DELETE'});tabOutline()});
+}
+
+async function tabEvents(){
+  const es=await api('/api/books/'+BK+'/events');
+  const label={open_loop_created:'埋伏笔',open_loop_closed:'收伏笔',character_state_changed:'状态变更',power_breakthrough:'突破',relationship_changed:'关系',world_rule_revealed:'规则',promise_created:'立誓',promise_paid_off:'偿约',artifact_obtained:'得物'};
+  $('#tabBody').innerHTML=\`<div class="card"><b>事件流</b>（data-agent 回写的跨章事实，供后续任务书引用）
+    \${es.slice().reverse().map(e=>\`<div class="row small"><span class="badge">\${e.chapter_seq}章</span> <b>\${label[e.event_type]||e.event_type}</b> \${e.subject?e.subject:''} <span class="muted">\${(e.payload||'')}</span></div>\`).join('')||'<div class="muted">暂无事件。写完一章（含回写）后这里会有记录。</div>'}
+  </div>\`;
+}
+
+// ---- 生成大纲并入库 ----
+async function genOutline(){try{const r=await api('/api/ai/outline',{method:'POST',body:{bookId:BK,count:10,save:true}});toast('已生成并入库 '+r.added+' 条章纲<br><pre>'+r.text.slice(0,400)+'</pre>');tabOutline()}catch(e){toast(e.message,'bad')}}
+async function expandSetting(){try{const r=await api('/api/ai/expand-setting',{method:'POST',body:{bookId:BK,kind:'world'}});toast('设定已扩展（可切到世界观查看）')}catch(e){toast(e.message,'bad')}}
+
+// ---- 6 步流水线 UI ----
+async function runPipe(mode){
+  const p=$('#pipePanel');p.style.display='';
+  p.innerHTML=\`<div class="card"><b>⚡ 写章流水线（\${mode}）</b><div class="progress"><i id="ppBar" style="width:0%"></i></div><div id="stageList">准备…</div></div>\`;
+  const stages=['① 任务书','② 起草','③ 五维审查','④ 润色','⑤ 事实提取','⑥ 确定性回写'];
+  const setStage=i=>{stages.slice(0,i).forEach(s=>0);$('#stageList').innerHTML=stages.map((s,j)=>\`<div>\${j<i?'✅':'⏳'} \${s}</div>\`).join('')+'<div class="muted small">运行中… 约 1-3 分钟，请勿刷新</div>';$('#ppBar').style.width=((i+0.5)/stages.length*100)+'%'};
+  setStage(0);
+  try{
+    const r=await api(\`/api/books/\${BK}/pipeline\`,{method:'POST',body:{mode,words:2000}});
+    $('#ppBar').style.width='100%';
+    const rc=r.review||{};
+    p.innerHTML=\`<div class="card"><b>✅ 第\${r.seq}章「\${r.title}」</b> <span class="badge \${r.status==='committed'?'ok':'bad'}">\${r.status==='committed'?'已回写 committed':'rejected（有阻断）'}</span>
+      <span class="badge">\${r.ms}ms</span><span class="badge">\${r.fixed} 处阻断已修</span><span class="badge">埋\${r.loopsPlanted}/收\${r.loopsRecycled} 伏笔</span><span class="badge">\${r.events} 条事件</span>
+      \${r.hasPlaceholder?'<span class="badge bad">检测到占位符，已降级</span>':''}
+      <div class="row">\${['standard','fast','minimal'].map(m=>\`<button data-rerun="\${m}">重跑\${m==='standard'?'标准':m==='fast'?'快速':'极简'}</button>\`).join('')}</div>
+      <details><summary>正文</summary><pre>\${r.content}</pre></details>
+      \${rc.issues?.length?\`<details><summary>审查（\${rc.issues_count} 项）</summary><pre>\${JSON.stringify(rc,null,1).slice(0,800)}</pre></details>\`:''}
+      <details><summary>摘要 / 钩子</summary><pre>\${r.summary||'(空)'}\${r.hook?'\n钩：'+r.hook:''}</pre></details>
+      <div class="muted small">切到「伏笔/事件流/角色」标签查看回写结果；紧急伏笔会自动进入下一章任务书。</div>
+    </div>\`;
+    p.querySelectorAll('[data-rerun]').forEach(b=>b.onclick=()=>runPipe(b.dataset.rerun));
+    // 刷新章节列表
+    if(TAB==='chapters')tabChapters();
+  }catch(e){p.innerHTML=\`<div class="card bad"><b>流水线失败</b><div>\${e.message}</div></div>\`}
+}
+
+// ---- 管理端 ----
+async function openAdmin(){
+  const main=$('#view');
+  main.innerHTML=\`<div class="card"><b>管理员</b><div class="row">
+    <input id="aEmail" placeholder="admin@x.com" style="width:200px"><input id="aPass" type="password" placeholder="密码" style="width:150px">
+    <button class="primary" id="aLogin">登录</button><button id="aInit">初始化首个管理员</button></div>
+    <div id="aMsg" class="muted small"></div>
+    <div id="aBody" style="display:none"></div>
+  </div>\`;
+if(localStorage.getItem('nvs_admin_token')){showAdmin();return}
+  const doLogin=init=>{const b=async()=>{try{const r=await api(init?'/api/admin/init':'/api/admin/login',{method:'POST',body:{email:$('#aEmail').value,password:$('#aPass').value}});ADMIN={token:r.token||r.admin_email||'init',email:$('#aEmail').value};if(r.token)localStorage.setItem('nvs_admin_token',r.token);save();$('#aMsg').textContent='';showAdmin()};b()};
+  $('#aLogin').onclick=()=>doLogin(false);$('#aInit').onclick=()=>doLogin(true);
+  window._showAdmin=showAdmin;
+  async function showAdmin(){
+    const st=await api('/api/admin/stats',{headers:{}}).catch(async()=>{const r=await fetch('/api/admin/stats',{headers:{Authorization:'Bearer '+localStorage.getItem('nvs_admin_token')}});return r.json()});
+    const users=await (async()=>{const r=await fetch('/api/admin/users',{headers:{Authorization:'Bearer '+localStorage.getItem('nvs_admin_token')}});return r.ok?r.json():[]})();
+    const codes=await (async()=>{const r=await fetch('/api/admin/codes',{headers:{Authorization:'Bearer '+localStorage.getItem('nvs_admin_token')}});return r.ok?r.json():{codes:[]}})();
+    $('#aBody').style.display='';
+    $('#aBody').innerHTML=\`
+    <div class="row"><b>站点</b> 用户 \${st.users} · 书 \${st.books} · 章 \${st.chapters} · 7日用量 \${st.usage7d} · 未回收伏笔 \${st.open_loops} · 可用注册码 \${st.free_codes}</div>
+    <div class="card"><b>注册码</b> <label class="row"><input type="checkbox" id="aReq" \${codes.require_invite?'checked':''}> 要求注册码</label>
+      <div class="row"><button class="primary" id="aGen">生成 5 个码</button></div>
+      <div class="thumbs" id="aCodes"></div></div>
+    <div class="card"><b>用户</b><table><tr><th>邮箱</th><th>书</th><th>AI调用</th><th>状态</th><th></th></tr>
+      \${users.map(u=>\`<tr><td>\${u.email}</td><td>\${u.books}</td><td>\${u.ai_calls||0}</td><td>\${u.blocked?'<span class="badge bad">停用</span>':'<span class="badge ok">正常</span>'}</td>
+      <td><button class="ub" data-e="\${u.email}">\${u.blocked?'解禁':'停用'}</button></td></tr>\`).join('')||'<tr><td colspan="5" class="muted">无用户</td></tr>'}</table></div>\`;
+    $('#aCodes').innerHTML=codes.codes.map(c=>\`<span class="badge \${c.revoked?'bad':c.used_by?'':'ok'}">\${c.code}\${c.used_by?' ←'+c.used_by:''}</span>\`).join(' ');
+    $('#aGen').onclick=async()=>{const r=await fetch('/api/admin/codes',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+localStorage.getItem('nvs_admin_token')},body:JSON.stringify({count:5,require:$('#aReq').checked})});const d=await r.json();toast('已生成：<pre>'+(d.codes||[]).join('<br>')+'</pre>（发给用户注册）');showAdmin()};
+    $('#aReq').onchange=async()=>{await fetch('/api/admin/settings',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+localStorage.getItem('nvs_admin_token')},body:JSON.stringify({require_invite:$('#aReq').checked})});showAdmin()};
+    document.querySelectorAll('.ub').forEach(b=>b.onclick=async()=>{await fetch('/api/admin/users/'+encodeURIComponent(b.dataset.e)+'/flag',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+localStorage.getItem('nvs_admin_token')},body:JSON.stringify({blocked:b.textContent==='停用'?'0':'1'})});showAdmin()});
+  }
+}
+$('#btnAdmin').onclick=()=>openAdmin();
+
+// ---- 启动 ----
+(async function init(){
+  if(TK){try{await afterLogin()}catch{localStorage.removeItem('nvs_token')}}
+  // 管理员入口（邮箱含 @admin 或单独登录）
+  const adminT=localStorage.getItem('nvs_admin_token');if(adminT){$('#btnAdmin').style.display=''}
 })();
-</script></body></html>`;
+</script>
+</body></html>`;
 
 // ---------- router ----------
-const routes = Object.entries(api);
+// 公开路由无需 token；/api/admin/* 需 admin token（Header Authorization: Bearer <admin_token>）；其余需用户 token
+const publicRoutes = ["POST /api/register", "POST /api/login"];
+const adminRoutes = ["POST /api/admin/init", "POST /api/admin/login"];
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     if (req.method === "OPTIONS")
-      return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type,Authorization" } });
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type,Authorization",
+        },
+      });
 
     if (!url.pathname.startsWith("/api")) {
       return new Response(HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
-    const publicRoutes = ["POST /api/register", "POST /api/login"];
-    for (const [route, fn] of routes) {
+
+    const authTok = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+    for (const [route, fn] of Object.entries(api)) {
       const [m, p] = route.split(" ");
       const head = p.split("/").filter(Boolean);
       const parts = url.pathname.split("/").filter(Boolean);
@@ -473,6 +1083,14 @@ export default {
       if (!ok || req.method !== m) continue;
       try {
         if (publicRoutes.includes(route)) return await fn(env, req, match, null);
+        if (adminRoutes.includes(route)) {
+          // 初始化/登录：admin_auth 空表允许 init；登录需要已有管理员
+          return await fn(env, req, match, null);
+        }
+        if (p.startsWith("/api/admin/")) {
+          const admin = authTok ? await authAdmin(env, { headers: new Headers({ Authorization: "Bearer " + authTok }) }) : null;
+          return await fn(env, req, match, admin);
+        }
         const email = await authUser(env, req);
         return await fn(env, req, match, email);
       } catch (e) {
