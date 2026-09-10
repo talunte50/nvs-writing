@@ -30,5 +30,5 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 INSERT OR IGNORE INTO settings(key, value) VALUES ('llm_provider','openai');
 INSERT OR IGNORE INTO settings(key, value) VALUES ('llm_base_url','https://openrouter.ai/api/v1');
-INSERT OR IGNORE INTO settings(key, value) VALUES ('llm_model','nvidia/nemotron-3-super-120b-a12b:free');
+INSERT OR IGNORE INTO settings(key, value) VALUES ('llm_model','nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free');
 INSERT OR IGNORE INTO settings(key, value) VALUES ('admin_token','nvs-writing-admin');

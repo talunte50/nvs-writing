@@ -4,7 +4,7 @@
 const DEFAULT_SETTINGS = {
   llm_provider: "openai", // openai = 任意 OpenAI 兼容端点; cf-ai = Cloudflare Workers AI
   llm_base_url: "https://openrouter.ai/api/v1",
-  llm_model: "nvidia/nemotron-3-super-120b-a12b:free",
+  llm_model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
   llm_key: "",
   admin_token: "nvs-writing-admin",
 };
@@ -106,7 +106,11 @@ const api = {
     const r = await env.DB.prepare(
       "INSERT INTO books(title, genre, logline, world_setting, characters) VALUES(?,?,?,?,?)"
     ).bind(b.title || "未命名", b.genre || "", b.logline || "", b.world_setting || "", b.characters || "").run();
-    const id = r.meta?.last_rowid;
+    let id = Number(r.meta?.last_rowid);
+    if (!id || Number.isNaN(id)) {
+      const last = await env.DB.prepare("SELECT MAX(id) AS m FROM books").first();
+      id = Number(last?.m ?? 0);
+    }
     return json({ id });
   },
   "PATCH /api/books/:id": async (env, req, p) => {
@@ -134,7 +138,12 @@ const api = {
     const maxRow = await env.DB.prepare("SELECT MAX(seq) AS m FROM chapters WHERE book_id=?").bind(p.id).first();
     const seq = (maxRow?.m || 0) + 1;
     const r = await env.DB.prepare("INSERT INTO chapters(book_id, seq, title) VALUES(?,?,?)").bind(p.id, seq, "新章节").run();
-    return json({ id: r.meta?.last_rowid, seq });
+    let id = Number(r.meta?.last_rowid);
+    if (!id || Number.isNaN(id)) {
+      const last = await env.DB.prepare("SELECT MAX(id) AS m FROM chapters").first();
+      id = Number(last?.m ?? 0);
+    }
+    return json({ id, seq });
   },
   "GET /api/chapters/:id": async (env, req, p) => {
     const row = await env.DB.prepare("SELECT * FROM chapters WHERE id=?").bind(p.id).first();
@@ -228,8 +237,8 @@ const api = {
   },
   "POST /api/settings": async (env, req, p) => {
     const s = await getSettings(env);
-    if ((await req.json().catch(() => ({}))).admin_token !== s.admin_token) return json({ error: "wrong admin token" }, 403);
-    const b = await req.json().catch(() => ({}));
+    const b = await req.json().catch(() => ({})); // 只读一次 body
+    if (b.admin_token !== s.admin_token) return json({ error: "wrong admin token" }, 403);
     for (const k of ["llm_provider", "llm_base_url", "llm_model"]) if (b[k] !== undefined) await setSetting(env, k, b[k]);
     if (b.llm_key !== undefined && b.llm_key !== "") await setSetting(env, "llm_key", b.llm_key);
     return json({ ok: true });
@@ -290,7 +299,7 @@ textarea{resize:vertical}
    <option value="openai">OpenAI 兼容（OpenRouter/Groq/DeepSeek/Moonshot/Ollama/vLLM…）</option>
    <option value="cf-ai">Cloudflare Workers AI（免费额度，模型如 @cf/meta/llama-3.1-8b-instruct）</option></select></div>
   <div style="margin-top:8px"><label class="tag">Base URL（OpenAI 兼容端点）</label><input id="s_base" value="https://openrouter.ai/api/v1"></div>
-  <div style="margin-top:8px"><label class="tag">模型</label><input id="s_model" value="nvidia/nemotron-3-super-120b-a12b:free"></div>
+  <div style="margin-top:8px"><label class="tag">模型</label><input id="s_model" value="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"></div>
   <div style="margin-top:8px"><label class="tag">API Key（留空=用服务端已存）</label><input id="s_key" type="password" placeholder="sk-…"></div>
   <div style="margin-top:8px"><label class="tag">管理密码</label><input id="s_token" type="password" placeholder="admin_token"></div>
   <div class="row" style="margin-top:12px"><button id="savecfg">保存设置</button><span id="cfgmsg" class="tag"></span><span id="s_note" class="tag" style="margin-left:8px"></span></div>
