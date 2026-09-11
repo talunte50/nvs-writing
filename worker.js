@@ -1138,6 +1138,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 </style></head><body><div id="app">
 <header>
   <h1 id="siteName">NVS 写作台</h1>
+  <button id="btnAuth">登录 / 注册</button>
   <span class="mut" id="who"></span>
   <button id="btnTheme" title="昼夜切换">◐</button>
   <button id="btnAdmin">管理</button>
@@ -1186,13 +1187,15 @@ setTheme(localStorage.getItem('nvs_theme')||'night');
 $('#btnTheme').onclick=()=>setTheme(document.documentElement.getAttribute('data-theme')==='day'?'night':'day');
 
 // ---- 认证 ----
+function setAuthUI(logged){ $('#btnAuth').style.display=logged?'none':''; $('#btnOut').style.display=logged?'':'none'; $('#who').textContent=logged?EMAIL:''; }
 async function afterLogin(){
   const me=await api('/api/me').catch(()=>({}));EMAIL=me.email||EMAIL;save();
   if(me.site_name)$('#siteName').textContent=me.site_name;
   if(me.announcement)toast('<b>公告</b><br>'+me.announcement);
-  $('#authPane').style.display='none';$('#dataPane').style.display='';$('#who').textContent=EMAIL;
+  $('#authPane').style.display='none';$('#dataPane').style.display='';setAuthUI(true);
   await loadBooks();
 }
+$('#btnAuth').onclick=()=>showLogin();
 $('#btnLogin').onclick=async()=>{try{const b=await api('/api/login',{method:'POST',body:{email:$('#liEmail').value,password:$('#liPass').value}});TK=b.token;EMAIL=b.email;save();$('#authPane').style.display='none';await afterLogin()}catch(e){$('#authMsg').textContent=e.message}};
 $('#btnReg').onclick=async()=>{try{const b=await api('/api/register',{method:'POST',body:{email:$('#liEmail').value,password:$('#liPass').value,invite:$('#liInvite').value}});TK=b.token;EMAIL=b.email;save();$('#authPane').style.display='none';await afterLogin()}catch(e){$('#authMsg').textContent=e.message}};
 $('#btnLoginClose').onclick=()=>{$('#authPane').style.display='none';$('#authMsg').textContent=''};
@@ -1475,7 +1478,7 @@ $('#btnAdmin').onclick=()=>openAdmin();
   if(!TK)showLogin();
   // 管理按钮常显（BUG-3）；面板内部走 admin token 登录（BUG-4），不会死循环
 })();
-function showLogin(){$('#authPane').style.display='grid';$('#dataPane').style.display='none';$('#view').innerHTML='<div class="muted">未登录。点右上「登录 / 注册」开始；管理员请点右上「管理」。</div>';$('#authMsg').textContent=''}
+function showLogin(){$('#authPane').style.display='grid';$('#dataPane').style.display='none';setAuthUI(false);$('#view').innerHTML='<div class="muted">未登录。点右上「登录 / 注册」开始；管理员请点右上「管理」。</div>';$('#authMsg').textContent=''}
 
 </script>
 </body></html>`;
