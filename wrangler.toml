@@ -1,6 +1,8 @@
 name = "nvs-writing"
 main = "worker.js"
 compatibility_date = "2026-01-01"
+# 账号级 token 无用户 API 权限：写死 account_id，避免 wrangler 走 /memberships（9106）
+account_id = "e37a11d98a0ba5a74989138bd2dd65c7"
 
 # 首次部署后由 wrangler 自动填充 database_id
 # [[d1_databases]]

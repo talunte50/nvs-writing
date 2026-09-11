@@ -42,6 +42,8 @@ const toml = `name = "nvs-writing"
 main = "worker.js"
 compatibility_date = "2026-01-01"
 compatibility_flags = ["nodejs_compat"]
+# 账号级 API token 无用户 API 权限，必须写死 account_id，否则 wrangler 调 /memberships 会 9106
+account_id = "${ACCOUNT_ID}"
 
 [[d1_databases]]
 binding = "DB"
