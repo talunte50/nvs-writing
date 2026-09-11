@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS books (
   logline TEXT DEFAULT '',              -- 故事梗概（一句话）
   world_setting TEXT DEFAULT '',
   characters TEXT DEFAULT '',           -- 遗留字段（v2 用 roles 表；旧数据已迁移进 roles）
+  anti_ai_rules TEXT DEFAULT '',        -- 本书 AI 味负面清单（空=用站点默认 anti_ai_default）
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -40,6 +41,7 @@ CREATE TABLE IF NOT EXISTS roles (
   name TEXT NOT NULL,
   role_type TEXT DEFAULT '角色',        -- 角色/组织/地点/物品/势力
   profile TEXT DEFAULT '',              -- 简介/能力/境界
+  voice TEXT DEFAULT '',               -- 语言声纹：用词/句式/口头禅/信息量（对话区分度用）
   is_protagonist INTEGER NOT NULL DEFAULT 0,
   state_note TEXT DEFAULT '',           -- 当前状态（随章节推进更新，data-agent 回写）
   created_at TEXT DEFAULT (datetime('now'))
@@ -82,6 +84,33 @@ CREATE TABLE IF NOT EXISTS outline_items (
   created_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_outline_book ON outline_items(book_id);
+
+-- 事实账本（跨章一致性真源：data-agent 提取 + 人工校正；写章前按 type 注入）
+-- fact_type: state(状态) / knowledge(谁知道什么) / lineage(身世谱系) / rule(世界规则) / other
+CREATE TABLE IF NOT EXISTS ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  book_id INTEGER NOT NULL,
+  chapter_seq INTEGER DEFAULT 0,     -- 产生于哪章（0=开书前人工设定）
+  fact_type TEXT DEFAULT 'state',
+  subject TEXT DEFAULT '',            -- 主体（角色名/实体）
+  fact TEXT NOT NULL,
+  source TEXT DEFAULT 'ai',          -- ai(流水线提取) / manual(人工)
+  status TEXT DEFAULT 'active',       -- active / superseded / corrected
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_book ON ledger(book_id);
+
+-- 分层摘要（卷级滚动压缩：章节多了后 state-pack 注入摘要而非全量）
+CREATE TABLE IF NOT EXISTS summaries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  book_id INTEGER NOT NULL,
+  level TEXT DEFAULT 'volume',       -- volume（卷）
+  seq_from INTEGER DEFAULT 1,
+  seq_to INTEGER DEFAULT 0,
+  text TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_summaries_book ON summaries(book_id);
 
 CREATE TABLE IF NOT EXISTS users (
   email TEXT PRIMARY KEY,
@@ -130,6 +159,8 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT OR IGNORE INTO settings(key,value) VALUES('require_invite','1');
 INSERT OR IGNORE INTO settings(key,value) VALUES('site_name','NVS 写作台');
 INSERT OR IGNORE INTO settings(key,value) VALUES('announcement','');
+-- 站点默认 AI 味负面清单（书级 anti_ai_rules 为空时回退到此）
+INSERT OR IGNORE INTO settings(key,value) VALUES('anti_ai_default','禁止套话：不禁/仿佛/眼中闪过一丝/嘴角勾起一抹/值得注意的是/总而言之/命运的齿轮；禁止连续三个以上排比句；禁止解释性旁白（用动作与细节代替评论）；句式长短必须有变化；每个角色说话要有区分度（用词/信息量/口头禅不同）');
 
 -- 用量统计
 CREATE TABLE IF NOT EXISTS ai_usage (

@@ -3,3 +3,4 @@ wrangler.local.toml
 .env
 *.log
 .wrangler/
+out-test.epub

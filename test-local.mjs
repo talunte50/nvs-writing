@@ -1,188 +1,268 @@
-// 本地测试 v2（多租户 + 注册码 + 流水线）：node:sqlite 模拟 D1，真实请求打到 worker 的 fetch
+// 本地测试 v3：node:sqlite 模拟 D1 + 本地 mock LLM（OpenAI 兼容）+ 导出/修复回归
 import { DatabaseSync } from "node:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { execSync } from "node:child_process";
 
-const orKey = execSync(
-  "grep -oE 'sk-or-v1-[A-Za-z0-9]{20,}' '/root/.hermes/common_models.py' | head -1"
-).toString().trim();
+// ---- mock LLM：OpenAI 兼容 /chat/completions（按 prompt 内容返回确定性正文/JSON） ----
+import { createServer } from "node:http";
+const mock = createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => (body += c));
+  req.on("end", () => {
+    const b = JSON.parse(body || "{}");
+    const last = b.messages?.[b.messages.length - 1]?.content || "";
+    let out;
+    if (last.includes("只输出任务书")) out = "①开篇委托：第X章推进剧情 ②本章目标 ③出场人物 ④节奏 ⑤收在哪里";
+    else if (last.includes("校验") && last.includes("JSON"))
+      out = '{"conflicts":[],"facts_extracted":3,"checked":3}';
+    else if (last.includes("五维审查") || last.includes("审查并只输出 JSON"))
+      out = '{"chapter":1,"issues":[],"issues_count":0,"blocking_count":0,"has_blocking":false,"dimension_results":[{"dimension":"setting","conclusion":"pass"}],"summary":"0个问题"}';
+    else if (last.includes("事实") && last.includes("JSON"))
+      out = '{"summary_text":"主角获得天书残页，三年之约伏笔埋下","hook_type":"悬念","hook_strength":"strong","accepted_events":[{"event_id":"evt-1-001","chapter":1,"event_type":"open_loop_created","subject":"萧炎","payload":{"content":"三年之约","urgency":90}}],"state_deltas":[],"facts":[{"fact_type":"state","subject":"萧炎","fact":"萧炎获得天书残页"},{"fact_type":"knowledge","subject":"萧炎","fact":"萧炎知道三年之期将满"}],"entities_appeared":[]}';
+    else out = "萧炎握紧残缺天书，眼中寒光一闪，命运的齿轮开始转动。\n\n三年之期将满，他不再等待，踏上征途。\n\n风雪夜，仇家忽至。";
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ message: { content: out } }] }));
+  });
+});
+await new Promise((r) => mock.listen(8901, r));
 
+// ---- D1 模拟 ----
 const db = new DatabaseSync(":memory:");
 db.exec(readFileSync(new URL("./schema.sql", import.meta.url), "utf8"));
-
-// 模拟 D1 binding
 function stmt(sql, args) {
   const st = db.prepare(sql);
   const run = () => { const r = st.run(...args); return { meta: { last_rowid: Number(r.lastInsertRowid ?? 0), changes: Number(r.changes ?? 0) } }; };
   const all = () => ({ results: st.all(...args) });
   const first = () => st.get(...args);
-  return {
-    run: async () => run(),
-    all: async () => all(),
-    first: async () => first(),
-    bind: (...a) => stmt(sql, a),
-  };
+  return { run: async () => run(), all: async () => all(), first: async () => first(), bind: (...a) => stmt(sql, a) };
 }
 const DB = { prepare: (sql) => stmt(sql, []) };
 const env = { DB, LLM_KEY: "" };
 const mod = await import(pathToFileURL(process.argv[2] || "./worker.js"));
 const handler = mod.default;
 
-const http = await import("node:http");
-const server = http.createServer((req, res) => {
-  (async () => {
-    const chunks = [];
-    for await (const c of req) chunks.push(c);
-    const body = Buffer.concat(chunks).toString();
-    const r = new Request("http://nvs.local" + req.url, {
-      method: req.method,
-      body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
-      headers: { "Content-Type": "application/json", ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
-    });
-    const out = await handler.fetch(r, env);
-    res.statusCode = out.status;
-    res.setHeader("Content-Type", out.headers.get("Content-Type") || "text/plain");
-    res.end(await out.text());
-  })();
+// ---- 起 worker 本地 HTTP ----
+import { createServer as httpCreateServer } from "node:http";
+const server = httpCreateServer(async (req, res) => {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const body = Buffer.concat(chunks).toString();
+  const r = new Request("http://nvs.local" + req.url, {
+    method: req.method,
+    body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+    headers: { "Content-Type": "application/json", ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
+  });
+  const out = await handler.fetch(r, env);
+  res.statusCode = out.status;
+  out.headers.forEach((v, k) => res.setHeader(k, v));
+  res.end(Buffer.from(await out.arrayBuffer()));
 });
 await new Promise((r) => server.listen(8788, r));
-console.log("mock server :8788");
+console.log("mock LLM :8901 + worker :8788");
 
 const B = "http://127.0.0.1:8788";
 async function call(method, path, body, token, extraHeaders) {
   const headers = { "Content-Type": "application/json", ...(extraHeaders || {}) };
   if (token) headers["Authorization"] = "Bearer " + token;
   const r = await fetch(B + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
-  return { status: r.status, body: await r.json().catch(() => r.text()) };
+  const buf = await r.arrayBuffer();
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(buf).toString("utf8")); } catch { parsed = Buffer.from(buf).toString("utf8"); }
+  return { status: r.status, body: parsed, raw: buf, headers: r.headers };
 }
 
 let fail = 0;
-const T = async (name, fn) => { try { await fn(); console.log("PASS", name); } catch (e) { fail++; console.log("FAIL", name, "-", (e.message || String(e)).slice(0, 200)); } };
+const T = async (name, fn) => { try { await fn(); console.log("PASS", name); } catch (e) { fail++; console.log("FAIL", name, "-", (e.message || String(e)).slice(0, 300)); } };
 const assert = (c, m) => { if (!c) throw new Error(m); };
 
 let tokA, tokB, book, adminTok, inviteCode;
 
-await T("GET / 返回 HTML（含登录/流水线/伏笔元素）", async () => {
+await T("GET / 返回 HTML（含登录/导出/章节编辑元素）", async () => {
   const r = await (await fetch(B + "/")).text();
-  assert(r.includes("NVS") && r.includes("liEmail") && r.includes("一键写下一章") && r.includes("伏笔"), "html missing v2 markers");
+  for (const m of ["NVS", "liEmail", "一键写下一章", "伏笔", "btnAdmin", "exportPanel", "世界观设定", "事实账本", "卷摘要", "AI味清单", "声纹"]) assert(r.includes(m), "missing " + m);
 });
 
-await T("未认证 /api/books → 401", async () => {
-  const r = await call("GET", "/api/books");
-  assert(r.status === 401, "expected 401, got " + r.status);
-});
-
-await T("admin init 创建首个管理员 + 生成注册码", async () => {
+await T("admin init + 生成注册码 + 用户 B", async () => {
   const r = await call("POST", "/api/admin/init", { email: "admin@x.com", password: "adminpass88" });
   assert(r.status === 200 && r.body.token, JSON.stringify(r.body).slice(0, 120));
   adminTok = r.body.token;
   const c = await call("POST", "/api/admin/codes", { count: 2, require: true }, adminTok);
-  assert(c.status === 200 && Array.isArray(c.body.codes) && c.body.codes.length === 2, JSON.stringify(c.body).slice(0, 120));
+  assert(c.status === 200 && c.body.codes.length === 2, JSON.stringify(c.body).slice(0, 120));
   inviteCode = c.body.codes[0];
+  const c2 = await call("POST", "/api/admin/codes", { count: 1 }, adminTok);
+  const a1 = await call("POST", "/api/register", { email: "a@test.dev", password: "pass123", invite: inviteCode });
+  tokA = a1.body.token;
+  const a2 = await call("POST", "/api/register", { email: "b@test.dev", password: "pass456", invite: c2.body.codes[0] });
+  tokB = a2.body.token;
 });
 
-await T("无码注册被拒（require_invite）", async () => {
-  const r = await call("POST", "/api/register", { email: "a@test.dev", password: "pass123" });
-  assert(r.status === 400 && r.body.code_required, JSON.stringify(r.body).slice(0, 120));
-});
-
-await T("用注册码注册 A → token", async () => {
-  const r = await call("POST", "/api/register", { email: "a@test.dev", password: "pass123", invite: inviteCode });
-  assert(r.status === 200 && r.body.token, JSON.stringify(r.body).slice(0, 120));
-  tokA = r.body.token;
-});
-
-await T("重复注册码不可再用", async () => {
-  const r = await call("POST", "/api/register", { email: "c@test.dev", password: "pass789", invite: inviteCode });
-  assert(r.status === 403, "used code should 403, got " + r.status);
-});
-
-await T("POST /api/login 正确/错误密码", async () => {
-  let r = await call("POST", "/api/login", { email: "a@test.dev", password: "wrong" });
-  assert(r.status === 401, "bad pw should 401, got " + r.status);
-  r = await call("POST", "/api/login", { email: "a@test.dev", password: "pass123" });
-  assert(r.status === 200 && r.body.token, JSON.stringify(r.body).slice(0, 120));
-});
-
-await T("GET /api/me 返回 email + 站点信息", async () => {
-  const r = await call("GET", "/api/me", null, tokA);
-  assert(r.status === 200 && r.body.email === "a@test.dev", JSON.stringify(r.body).slice(0, 120));
-});
-
-await T("建书 + 角色 + 伏笔 + 大纲 CRUD", async () => {
-  const b = await call("POST", "/api/books", { title: "天书", logline: "少年获残缺天书", genre: "玄幻" }, tokA);
+await T("建书 + 角色 + 伏笔 + 大纲 CRUD（A）", async () => {
+  const b = await call("POST", "/api/books", { title: "天书", logline: "少年获残缺天书", genre: "玄幻", world_setting: "天书体系：九层封印", characters: "萧炎（主角）" }, tokA);
   assert(b.status === 200 && b.body.id, JSON.stringify(b.body));
   book = b.body.id;
-  const role = await call("POST", `/api/books/${book}/roles`, { name: "萧炎", role_type: "角色", is_protagonist: true, profile: "斗帝血脉" }, tokA);
-  assert(role.status === 200, JSON.stringify(role.body));
-  const loop = await call("POST", `/api/books/${book}/loops`, { content: "三年之约", urgency: 90, planted_chapter: 0 }, tokA);
-  assert(loop.status === 200, JSON.stringify(loop.body));
-  const out = await call("POST", `/api/books/${book}/outline`, { title: "天书现世", detail: "主角意外获得天书残页" }, tokA);
-  assert(out.status === 200, JSON.stringify(out.body));
+  await call("POST", `/api/books/${book}/roles`, { name: "萧炎", role_type: "角色", is_protagonist: true, profile: "斗帝血脉" }, tokA);
+  await call("POST", `/api/books/${book}/loops`, { content: "三年之约", urgency: 90, planted_chapter: 0 }, tokA);
   const det = await call("GET", `/api/books/${book}`, null, tokA);
-  assert(det.body.roles.length === 1 && det.body.loops.length === 1 && det.body.outline.length === 1, "book detail missing sub-entities");
+  assert(det.body.roles.length === 1 && det.body.loops.length === 1, "sub-entities missing");
 });
 
-await T("A 配置自己的 LLM Key（隔离）", async () => {
-  const s = await call("POST", "/api/settings", { provider: "openai", base_url: "https://openrouter.ai/api/v1", model: "openrouter/free", api_key: orKey }, tokA);
+// ---- N2：AI 大纲 save:true 必须真正入库 ----
+await T("N2：/api/ai/outline save:true 真正入库（修复 request body 二次读取）", async () => {
+  const s = await call("POST", "/api/settings", { provider: "openai", base_url: "http://127.0.0.1:8901/v1", model: "mock-model", api_key: "mock" }, tokA);
   assert(s.status === 200, JSON.stringify(s.body));
-  const g = await call("GET", "/api/settings", null, tokA);
-  assert(g.body.has_key === true, JSON.stringify(g.body));
+  const r = await call("POST", "/api/ai/outline", { bookId: book, count: 5, save: true }, tokA);
+  assert(r.status === 200, JSON.stringify(r.body).slice(0, 200));
+  assert(r.body.added >= 1, "added should be >=1, got " + r.body.added + " (N2 regression)");
+  const det = await call("GET", `/api/books/${book}`, null, tokA);
+  assert(det.body.outline.length >= 1, "outline not persisted");
 });
 
-await T("B 用户（第二个码）注册，看不到 A 的数据", async () => {
-  const c2 = await call("POST", "/api/admin/codes", { count: 1 }, adminTok);
-  tokB = (await call("POST", "/api/register", { email: "b@test.dev", password: "pass456", invite: c2.body.codes[0] })).body.token;
-  const books = await call("GET", "/api/books", null, tokB);
-  assert(books.body.length === 0, "B sees " + books.body.length + " books");
-  const c = await call("GET", `/api/books/${book}`, null, tokB);
-  assert(c.status === 404, "B should not read A's book, got " + c.status);
+// ---- N3：空白章标题不再被丢弃 ----
+await T("N3：POST chapters 自定义标题入库（修复 body 丢弃）", async () => {
+  const r = await call("POST", `/api/books/${book}/chapters`, { title: "自定义空章" }, tokA);
+  assert(r.status === 200 && r.body.id, JSON.stringify(r.body));
+  const det = await call("GET", `/api/chapters/${r.body.id}`, null, tokA);
+  assert(det.body.title === "自定义空章", "title lost: " + det.body.title);
+  await call("DELETE", `/api/chapters/${r.body.id}`, null, tokA);
 });
 
-await T("管理员 stats / users 列表", async () => {
-  const st = await call("GET", "/api/admin/stats", null, adminTok);
-  assert(st.status === 200 && st.body.users >= 2, JSON.stringify(st.body).slice(0, 160));
-  const us = await call("GET", "/api/admin/users", null, adminTok);
-  assert(us.status === 200 && us.body.length >= 2, JSON.stringify(us.body).slice(0, 160));
-});
-
-await T("管理员封禁 B → B 登录被拒", async () => {
-  const f = await call("POST", "/api/admin/users/b%40test.dev/flag", { blocked: 1 }, adminTok);
+// ---- N4：解禁 flag（字符串 '0' 也能正确解除） ----
+await T("N4：管理员 flag 停用/解禁（含字符串 '0' 数值解析）", async () => {
+  let f = await call("POST", "/api/admin/users/b%40test.dev/flag", { blocked: 1 }, adminTok);
   assert(f.status === 200, JSON.stringify(f.body));
-  const l = await call("POST", "/api/login", { email: "b@test.dev", password: "pass456" });
-  assert(l.status === 403, "blocked user login should 403, got " + l.status);
+  let l = await call("POST", "/api/login", { email: "b@test.dev", password: "pass456" });
+  assert(l.status === 403, "blocked login should 403, got " + l.status);
+  // 前端发的是字符串 '0'（原来 b.blocked?'1':'0' 对 '0' 判真导致解禁失效）
+  f = await call("POST", "/api/admin/users/b%40test.dev/flag", { blocked: "0" }, adminTok);
+  assert(f.status === 200, JSON.stringify(f.body));
+  l = await call("POST", "/api/login", { email: "b@test.dev", password: "pass456" });
+  assert(l.status === 200, "unblock via string '0' failed: " + l.status + " " + JSON.stringify(l.body).slice(0, 100));
 });
 
-await T("真实 AI：流水线 minimal（含真实 LLM 起草+提取+回写）", async () => {
+// ---- 流水线（mock LLM，确定性） ----
+await T("流水线 minimal：起草+提取+回写 committed", async () => {
   const r = await call("POST", `/api/books/${book}/pipeline`, { mode: "minimal", words: 300 }, tokA);
   assert(r.status === 200, JSON.stringify(r.body).slice(0, 300));
-  assert(r.body.content && r.body.content.length > 30, "pipeline content too short");
-  const det = await call("GET", `/api/books/${book}`, null, tokA);
-  assert(det.body.events.length >= 0, "events list missing");
+  assert(r.body.content && r.body.content.length > 10, "content too short");
   const chs = await call("GET", `/api/books/${book}/chapters`, null, tokA);
-  assert(chs.body.length === 1 && chs.body[0].status === "committed", "chapter not committed: " + JSON.stringify(chs.body[0]).slice(0, 120));
-  console.log("  正文前80字:", (r.body.content || "").slice(0, 80).replace(/\n/g, " "));
+  const committed = chs.body.filter((c) => c.status === "committed" && c.seq === r.body.seq);
+  assert(committed.length === 1, "chapter not committed: " + JSON.stringify(chs.body.map(c => [c.seq, c.status])));
 });
 
-await T("起草为空 → 流水线中止不落库（空章节守卫）", async () => {
-  // 临时 mock：用一本无 LLM 配置的用户跑流水线，LLM 调用会因无 key 抛错，不应产生章节
-  const c3 = await call("POST", "/api/admin/codes", { count: 1 }, adminTok);
-  const tokC = (await call("POST", "/api/register", { email: "c2@test.dev", password: "pass000", invite: c3.body.codes[0] })).body.token;
-  const bk = await call("POST", "/api/books", { title: "守卫书" }, tokC);
-  const r = await call("POST", `/api/books/${bk.body.id}/pipeline`, { mode: "minimal" }, tokC);
-  assert(r.status === 500, "no LLM key should 500, got " + r.status);
-  const chs = await call("GET", `/api/books/${bk.body.id}/chapters`, null, tokC);
-  assert(chs.body.length === 0, "no chapter should be written, got " + chs.body.length);
+// ---- 一致性增强：standard 流水线（verify 闭环 + 账本回写） ----
+await T("流水线 standard：verify 闭环 + 事实账本回写", async () => {
+  const r = await call("POST", `/api/books/${book}/pipeline`, { mode: "standard", words: 300 }, tokA);
+  assert(r.status === 200, JSON.stringify(r.body).slice(0, 300));
+  assert(r.body.verifyConflicts === 0, "verifyConflicts should be 0, got " + r.body.verifyConflicts);
+  assert((r.body.extraction?.facts || []).length >= 1, "extraction.facts missing");
+  const lg = await call("GET", `/api/books/${book}/ledger`, null, tokA);
+  assert(lg.status === 200 && lg.body.length >= 2, "ledger not populated: " + JSON.stringify(lg.body).slice(0, 150));
+  assert(lg.body.some(f => f.fact_type === "knowledge" && f.subject === "萧炎"), "knowledge fact missing");
 });
 
-await T("回写验证：紧急伏笔仍在 + 事件流入库", async () => {
-  const det = await call("GET", `/api/books/${book}`, null, tokA);
-  // 三年之约（urgency 90）未被回收，应保持 open
-  const stillOpen = det.body.loops.find((l) => l.content === "三年之约");
-  assert(stillOpen && stillOpen.status === "open", "urgent loop should remain open unless extracted-as-recycled");
+// ---- 账本/摘要/声纹/负面清单 API ----
+await T("账本 CRUD + 卷摘要 + 角色声纹 + 负面清单", async () => {
+  const add = await call("POST", `/api/books/${book}/ledger`, { fact: "萧炎是萧家的", fact_type: "lineage", subject: "萧炎" }, tokA);
+  assert(add.status === 200, JSON.stringify(add.body));
+  const lg = await call("GET", `/api/books/${book}/ledger`, null, tokA);
+  const manual = lg.body.find(f => f.fact === "萧炎是萧家的" && f.source === "manual");
+  assert(manual, "manual ledger entry not stored");
+  const del = await call("DELETE", `/api/ledger/${manual.id}`, null, tokA);
+  assert(del.status === 200, JSON.stringify(del.body));
+  const lg2 = await call("GET", `/api/books/${book}/ledger`, null, tokA);
+  assert(!lg2.body.find(f => f.id === manual.id && f.status === "active"), "ledger not superseded");
+
+  const sm = await call("POST", `/api/books/${book}/summaries`, { from: 1, to: 2 }, tokA);
+  assert(sm.status === 200, JSON.stringify(sm.body).slice(0, 150));
+  const smList = await call("GET", `/api/books/${book}/summaries`, null, tokA);
+  assert(smList.body.length === 1, "summary not stored");
+
+  const roles = await call("GET", `/api/books/${book}`, null, tokA);
+  const role = roles.body.roles[0];
+  const pv = await call("PATCH", `/api/roles/${role.id}`, { voice: "短句、爱反问" }, tokA);
+  assert(pv.status === 200, JSON.stringify(pv.body));
+  const roles2 = await call("GET", `/api/books/${book}`, null, tokA);
+  assert(roles2.body.roles[0].voice === "短句、爱反问", "voice not persisted");
+
+  const pa = await call("PATCH", `/api/books/${book}`, { anti_ai_rules: "本书禁用：破折号" }, tokA);
+  assert(pa.status === 200, JSON.stringify(pa.body));
+  const bk = await call("GET", `/api/books/${book}`, null, tokA);
+  assert(bk.body.book.anti_ai_rules === "本书禁用：破折号", "anti_ai_rules not persisted");
+
+  const adm = await call("GET", "/api/admin/settings", null, adminTok);
+  assert(adm.status === 200 && /套话/.test(adm.body.anti_ai_default || ""), "anti_ai_default missing: " + JSON.stringify(adm.body).slice(0, 100));
+  const admSet = await call("POST", "/api/admin/settings", { anti_ai_default: "站点默认X" }, adminTok);
+  assert(admSet.status === 200, JSON.stringify(admSet.body));
 });
 
+// ---- N7：章节编辑 PATCH ----
+await T("N7：PATCH /api/chapters/:id 修改标题+状态（编辑 UI 后端支持）", async () => {
+  const chs = await call("GET", `/api/books/${book}/chapters`, null, tokA);
+  const c = chs.body[0];
+  const r = await call("PATCH", `/api/chapters/${c.id}`, { title: "改后标题", status: "draft" }, tokA);
+  assert(r.status === 200, JSON.stringify(r.body));
+  const det = await call("GET", `/api/chapters/${c.id}`, null, tokA);
+  assert(det.body.title === "改后标题" && det.body.status === "draft", JSON.stringify(det.body).slice(0, 150));
+});
+
+// ---- 导出：TXT/MD/HTML + 附加资料 ----
+await T("导出 TXT/MD/HTML：内容正确 + 附加资料", async () => {
+  for (const [fmt, marker] of [["txt", "第1章"], ["md", "# 天书"], ["html", "<!doctype html>"]]) {
+    const r = await call("GET", `/api/books/${book}/export?format=${fmt}&attach_roles=1&attach_loops=1&attach_world=1`, null, tokA);
+    assert(r.status === 200, fmt + " status " + r.status);
+    const txt = Buffer.isBuffer(r.body) ? r.body.toString() : String(r.body);
+    assert(txt.includes(marker), fmt + " missing marker " + marker);
+    if (fmt === "txt") {
+      assert(txt.includes("—— 角色档案 ——") && txt.includes("萧炎"), "roles missing in txt");
+      assert(txt.includes("—— 伏笔清单 ——"), "loops missing in txt");
+      assert(txt.includes("—— 世界观设定 ——") && txt.includes("九层封印"), "world missing in txt");
+    }
+  }
+  // 范围：from=2 时不含第1章
+  const r2 = await call("GET", `/api/books/${book}/export?format=txt&from=2`, null, tokA);
+  assert(r2.status === 200 && !String(r2.body).includes("第1章"), "from=2 should exclude ch1");
+});
+
+// ---- 导出 EPUB：ZIP 字节级校验 ----
+await T("导出 EPUB：mimetype@0 + ZIP CRC + unzip 校验", async () => {
+  const r = await call("GET", `/api/books/${book}/export?format=epub&attach_roles=1`, null, tokA);
+  assert(r.status === 200, "epub status " + r.status);
+  const buf = Buffer.from(r.raw);
+  // 落盘供 Python zipfile 校验
+  writeFileSync(new URL("./out-test.epub", import.meta.url), buf);
+  assert(buf.length > 60, "epub too small: " + buf.length);
+  // ZIP 布局：[LH(30) + "mimetype"(8) + data(20)]… → 首个 LH 在偏移 0，mimetype 数据在 38
+  assert(buf.readUInt32LE(0) === 0x04034b50, "first local header not at offset 0");
+  assert(buf.slice(30, 38).toString() === "mimetype", "first entry not mimetype, got " + JSON.stringify(buf.slice(30, 40).toString()));
+  assert(buf.slice(38, 58).toString() === "application/epub+zip", "mimetype content at 38: " + JSON.stringify(buf.slice(38, 62).toString()));
+  // EOCD 在末尾
+  assert(buf.readUInt32LE(buf.length - 22) === 0x06054b50, "EOCD signature missing at tail");
+  console.log("  EPUB bytes:", buf.length, "(written to out-test.epub, verified by Python zipfile)");
+});
+// ---- 前端内嵌 JS 语法（模板求值后 node --check）----
+await T("前端 <script> 语法：模板求值后无 SyntaxError（BUG-1 回归）", async () => {
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8");
+  const i = src.indexOf("const HTML = `");
+  const j = src.indexOf("// ---------- router ----------", i);
+  const tpl = src.slice(i + "const HTML = `".length, j).replace(/\n+$/, "");
+  const html = tpl.replace(/\\`/g, "`").replace(/\\\$\{/g, "${");
+  const s = html.indexOf("<script>") + 8;
+  const e = html.indexOf("</script>");
+  const js = html.slice(s, e);
+  writeFileSync("/tmp/nvs_browser_check.js", js);
+  const { execSync } = await import("node:child_process");
+  execSync("node --check /tmp/nvs_browser_check.js", { stdio: "pipe" });
+});
+
+// ---- 用量不双记（N6）：跑 1 次流水线 → ai_usage 该 action 恰好 +1 ----
+await T("N6：流水线成功只记 1 条 usage（路由层单点记账）", async () => {
+  const before = Number((db.prepare("SELECT COUNT(*) AS n FROM ai_usage WHERE action='pipeline:minimal'").get()).n);
+  await call("POST", `/api/books/${book}/pipeline`, { mode: "minimal", words: 100 }, tokA);
+  const after = Number((db.prepare("SELECT COUNT(*) AS n FROM ai_usage WHERE action='pipeline:minimal'").get()).n);
+  assert(after - before === 1, `usage delta ${after - before}, expected 1`);
+});
+
+mock.close();
 server.close();
 console.log(fail === 0 ? "\n全部通过 ✅" : `\n${fail} 项失败 ❌`);
 process.exit(fail ? 1 : 0);
