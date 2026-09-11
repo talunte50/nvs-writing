@@ -45,7 +45,7 @@ console.log(`✓ 内嵌浏览器 JS 语法 OK（求值后 ${browserJs.length} �
 const must = [
   "btnAdmin", "authPane", "exportPanel", "showExportPanel", "editCh",
   "vExport", "btnLogin", "btnReg", "btnTheme", "runPipe", "openAdmin",
-  "admFetch", "showExportPanel",
+  "admFetch", "statusBar", "btnModel", "openModelPane", "adminUsers", "adminLlm", "adminSite",
 ];
 for (const m of must) {
   if (!browserJs.includes(m)) throw new Error(`浏览器 JS 缺少关键符号：${m}`);
@@ -57,6 +57,8 @@ const routes = [
   "GET /api/books/:id/export", "POST /api/ai/outline", "POST /api/admin/init",
   "POST /api/admin/login", "GET /api/admin/stats", "POST /api/books/:id/pipeline",
   "PATCH /api/chapters/:id", "POST /api/books/:id/chapters",
+  "GET /api/site", "POST /api/settings/test", "GET /api/admin/llm", "POST /api/admin/llm",
+  "POST /api/admin/users/:email", "DELETE /api/admin/users/:email",
 ];
 for (const r of routes) {
   if (!src.includes(`"${r}"`)) throw new Error(`worker 缺少路由：${r}`);

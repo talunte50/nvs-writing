@@ -68,7 +68,15 @@ function isAdmin(email) {
 async function getLlm(env, email) {
   const row = await env.DB.prepare("SELECT provider, base_url, model, api_key FROM llm_settings WHERE user_email=?").bind(email).first();
   const s = { ...LLM_DEFAULTS, api_key: "" };
-  if (row) Object.assign(s, row);
+  // 站点级默认 LLM（管理员在「模型管理」配置；JSON 存 settings.site_llm）
+  let site = null;
+  try { site = JSON.parse(await getSetting(env, "site_llm", "")); } catch {}
+  if (site && typeof site === "object" && (site.provider || site.model || site.api_key)) Object.assign(s, site);
+  if (row) {
+    // 用户 row 若仍为出厂默认（没填过 key、model/base_url 都是默认值）→ 视为未配置，用站点默认
+    const unconfigured = !row.api_key && row.model === LLM_DEFAULTS.model && (row.base_url === LLM_DEFAULTS.base_url || !row.base_url);
+    if (!unconfigured) Object.assign(s, row);
+  }
   if (s.provider === "openai" && !s.api_key && env.LLM_KEY) s.api_key = env.LLM_KEY; // 站点级兜底 key（wrangler [vars] LLM_KEY）
   return s;
 }
@@ -428,6 +436,17 @@ async function setSetting(env, key, value) {
 function requireInvite(env) { return true; } // settings.require_invite 在 register 内读
 
 const api = {
+  // 公开：站点信息（SEO meta / 站点名 / 公告；无需登录，供前端启动时注入 head）
+  "GET /api/site": async (env, req, p, admin) => {
+    return json({
+      site_name: await getSetting(env, "site_name", "NVS 写作台"),
+      announcement: await getSetting(env, "announcement", ""),
+      seo_desc: await getSetting(env, "seo_desc", ""),
+      seo_keywords: await getSetting(env, "seo_keywords", ""),
+      require_invite: (await getSetting(env, "require_invite", "1")) === "1",
+    });
+  },
+
   // ---- 认证（注册需注册码，管理员可关闭 require_invite） ----
   "POST /api/register": async (env, req) => {
     const b = await req.json().catch(() => ({}));
@@ -585,7 +604,7 @@ const api = {
   "POST /api/admin/settings": async (env, req, p, admin) => {
     if (!admin) return json({ error: "unauthorized" }, 401);
     const b = await req.json().catch(() => ({}));
-    for (const k of ["require_invite", "site_name", "announcement", "anti_ai_default"]) {
+    for (const k of ["require_invite", "site_name", "announcement", "anti_ai_default", "seo_desc", "seo_keywords"]) {
       if (b[k] !== undefined) await setSetting(env, k, String(b[k]));
     }
     return json({ ok: true });
@@ -593,8 +612,85 @@ const api = {
   "GET /api/admin/settings": async (env, req, p, admin) => {
     if (!admin) return json({ error: "unauthorized" }, 401);
     const out = {};
-    for (const k of ["require_invite", "site_name", "announcement", "anti_ai_default"]) out[k] = await getSetting(env, k);
+    for (const k of ["require_invite", "site_name", "announcement", "anti_ai_default", "seo_desc", "seo_keywords"]) out[k] = await getSetting(env, k);
     return json(out);
+  },
+  // 站点级默认 LLM（用户未配置模型时回退到此；JSON 存 settings.site_llm）
+  "GET /api/admin/llm": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    let s = {};
+    try { s = JSON.parse(await getSetting(env, "site_llm", "")) || {}; } catch {}
+    return json({ provider: s.provider || LLM_DEFAULTS.provider, base_url: s.base_url || LLM_DEFAULTS.base_url, model: s.model || LLM_DEFAULTS.model, has_key: !!s.api_key });
+  },
+  "POST /api/admin/llm": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const b = await req.json().catch(() => ({}));
+    const cur = await (async () => { try { return JSON.parse(await getSetting(env, "site_llm", "")) || {}; } catch { return {}; } })();
+    const next = {
+      provider: b.provider || cur.provider || LLM_DEFAULTS.provider,
+      base_url: b.base_url || cur.base_url || LLM_DEFAULTS.base_url,
+      model: b.model || cur.model || LLM_DEFAULTS.model,
+      api_key: b.api_key !== undefined ? b.api_key : (cur.api_key || ""), // 空串=保留旧 key（与用户端一致）
+    };
+    await setSetting(env, "site_llm", JSON.stringify(next));
+    return json({ ok: true });
+  },
+  // 站点模型连通测试（管理员配完点一下验证，逻辑与用户端 /api/settings/test 一致）
+  "POST /api/admin/llm/test": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const b = await req.json().catch(() => ({}));
+    let cur = {};
+    try { cur = JSON.parse(await getSetting(env, "site_llm", "")) || {}; } catch {}
+    const s = { ...LLM_DEFAULTS, api_key: cur.api_key || "", ...cur };
+    if (b.provider) s.provider = b.provider;
+    if (b.base_url) s.base_url = b.base_url;
+    if (b.model) s.model = b.model;
+    if (b.api_key) s.api_key = b.api_key;
+    if (s.provider === "cf-ai") return json({ ok: true, note: "Workers AI binding（需在 wrangler 配置 [[ai]]）" });
+    if (!s.api_key && env.LLM_KEY) s.api_key = env.LLM_KEY;
+    if (!s.api_key) return json({ ok: false, error: "没有可用的 API Key（站点未配、也未设 LLM_KEY 兜底）" });
+    const t0 = Date.now();
+    try {
+      const out = await chat(env, s, [{ role: "user", content: "只回复两个字：正常" }], { maxTokens: 40, temperature: 0 });
+      return json({ ok: true, model: s.model, ms: Date.now() - t0, reply: String(out).slice(0, 80) });
+    } catch (e) {
+      return json({ ok: false, error: String(e.message || e).slice(0, 300) });
+    }
+  },
+  // 会员管理：编辑（改密/重置 token）+ 删除（级联清理）
+  "POST /api/admin/users/:email": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const email2 = String(p.email).toLowerCase();
+    const target = await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(email2).first();
+    if (!target) return json({ error: "用户不存在" }, 404);
+    const b = await req.json().catch(() => ({}));
+    if (b.password && String(b.password).length >= 6) {
+      const salt = await genToken();
+      const hash = await sha256hex(salt + ":" + email2 + ":" + b.password);
+      await env.DB.prepare("UPDATE users SET salt=?, pass_hash=?, token='' WHERE email=?").bind(salt, hash, email2).run();
+    }
+    if (b.reset_token) {
+      const t = await genToken();
+      await env.DB.prepare("UPDATE users SET token=? WHERE email=?").bind(t, email2).run();
+    }
+    return json({ ok: true });
+  },
+  "DELETE /api/admin/users/:email": async (env, req, p, admin) => {
+    if (!admin) return json({ error: "unauthorized" }, 401);
+    const email2 = String(p.email).toLowerCase();
+    // 级联清理：书 → 章节/角色/伏笔/事件/大纲/账本/摘要/LLM 配置
+    const bookIds = (await env.DB.prepare("SELECT id FROM books WHERE owner_email=?").bind(email2).all()).results?.map((r) => r.id) || [];
+    if (bookIds.length) {
+      const ph = bookIds.map(() => "?").join(",");
+      for (const t of ["chapters", "roles", "foreshadows", "chapter_events", "outline_items", "ledger", "summaries"]) {
+        await env.DB.prepare(`DELETE FROM ${t} WHERE book_id IN (${ph})`).bind(...bookIds).run();
+      }
+      await env.DB.prepare(`DELETE FROM books WHERE id IN (${ph})`).bind(...bookIds).run();
+    }
+    await env.DB.prepare("DELETE FROM llm_settings WHERE user_email=?").bind(email2).run();
+    await env.DB.prepare("DELETE FROM invite_codes WHERE used_by=?").bind(email2).run(); // 释放注册码，可再发
+    await env.DB.prepare("DELETE FROM users WHERE email=?").bind(email2).run();
+    return json({ ok: true, books_removed: bookIds.length });
   },
 };
 
@@ -915,7 +1011,8 @@ Object.assign(api, {
   "GET /api/settings": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
     const s = await getLlm(env, email);
-    return json({ provider: s.provider, base_url: s.base_url, model: s.model, has_key: !!s.api_key });
+    const ownRow = await env.DB.prepare("SELECT provider, base_url, model, api_key FROM llm_settings WHERE user_email=?").bind(email).first();
+    return json({ provider: s.provider, base_url: s.base_url, model: s.model, has_key: !!s.api_key, using: ownRow && ownRow.api_key ? "mine" : "site" });
   },
   "POST /api/settings": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
@@ -926,6 +1023,27 @@ Object.assign(api, {
          provider=COALESCE(?,provider), base_url=COALESCE(?,base_url), model=COALESCE(?,model), api_key=CASE WHEN excluded.api_key != '' THEN excluded.api_key ELSE api_key END`
     ).bind(email, b.provider || LLM_DEFAULTS.provider, b.base_url || LLM_DEFAULTS.base_url, b.model || LLM_DEFAULTS.model, b.api_key || "", b.provider || null, b.base_url || null, b.model || null).run();
     return json({ ok: true });
+  },
+  // 模型连通测试：对「当前生效配置」发一次最小 chat，回报模型是否可用
+  "POST /api/settings/test": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const b = await req.json().catch(() => ({})); // 允许测试"尚未保存"的配置
+    const s = await getLlm(env, email);
+    if (b.provider || b.model || b.base_url || b.api_key) {
+      if (b.provider) s.provider = b.provider;
+      if (b.model) s.model = b.model;
+      if (b.base_url) s.base_url = b.base_url;
+      if (b.api_key) s.api_key = b.api_key;
+    }
+    if (s.provider === "cf-ai") return json({ ok: true, note: "Workers AI binding（无需测试外部连通）" });
+    if (!s.api_key) return json({ ok: false, error: "没有可用的 API Key（你的和站点的都没有）" });
+    const t0 = Date.now();
+    try {
+      const out = await chat(env, s, [{ role: "user", content: "只回复两个字：正常" }], { maxTokens: 40, temperature: 0 });
+      return json({ ok: true, model: s.model, ms: Date.now() - t0, reply: String(out).slice(0, 80) });
+    } catch (e) {
+      return json({ ok: false, error: String(e.message || e).slice(0, 300) });
+    }
   },
 
   // ---- 便捷 AI 动作（旧版兼容 + 大纲生成入库）----
@@ -1099,6 +1217,8 @@ Object.assign(api, {
 // ---------- 前端（统一 UI：三端响应式 + 昼夜主题 + 角色/伏笔/大纲管理 + 流水线 + 管理端） ----------
 const HTML = `<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta id="metaDesc" name="description" content="">
+<meta id="metaKw" name="keywords" content="">
 <title>NVS 写作台</title>
 <style>
 :root,[data-theme="day"]{--bg:#f5f6f8;--panel:#ffffff;--panel2:#eef0f4;--line:#d8dce2;--tx:#1c222b;--mut:#5d6675;--acc:#2064d8;--ok:#1f8a4c;--warn:#a8791a;--bad:#c03838}
@@ -1132,6 +1252,22 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 #exportPanel{margin-top:8px;border-top:1px dashed var(--line);padding-top:8px}
 #authPane input{margin:4px 0}
 #stageList div{padding:3px 0}
+/* 状态栏：页底常驻反馈条（最近一条操作结果） */
+#statusBar{position:fixed;left:50%;bottom:14px;transform:translateX(-50%);z-index:80;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 16px;max-width:min(560px,92vw);font-size:13px;box-shadow:0 4px 18px rgba(0,0,0,.22);display:none}
+#statusBar b{font-weight:600}
+#statusBar .sbBad{color:var(--bad)}#statusBar .sbOk{color:var(--ok)}
+#statusBar pre{margin:4px 0 0;font-size:12px;white-space:pre-wrap;max-height:120px;overflow:auto}
+/* 步骤条：把 6 步流水线画成可点的横向步骤（当前/完成/未开始） */
+.steps{display:flex;gap:4px;flex-wrap:wrap;margin:8px 0}
+.steps .st{flex:1;min-width:86px;text-align:center;font-size:12px;color:var(--mut);border:1px solid var(--line);border-radius:8px;padding:6px 4px;position:relative;background:var(--panel2)}
+.steps .st.on{border-color:var(--acc);color:var(--tx);background:var(--panel)}
+.steps .st.on::before{content:'●';color:var(--acc);margin-right:4px}
+.steps .st.done{border-color:var(--ok);color:var(--ok)}
+.steps .st.done::before{content:'✓';margin-right:4px}
+.steps .st.fail{border-color:var(--bad);color:var(--bad)}
+.steps .st.fail::before{content:'✗';margin-right:4px}
+/* 操作结果状态条（流水线面板内） */
+.resbar{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
 @media(max-width:1100px){#app{grid-template-columns:260px 1fr}}
 @media(max-width:820px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr}aside{border-right:none;border-bottom:1px solid var(--line);max-height:280px}#mobileBooks{display:block}}
 @media(max-width:520px){main{padding:10px}header .mut{display:none}}
@@ -1139,6 +1275,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 <header>
   <h1 id="siteName">NVS 写作台</h1>
   <button id="btnAuth">登录 / 注册</button>
+  <button id="btnModel" title="当前模型 / 换模型" style="display:none">🧠 模型</button>
   <span class="mut" id="who"></span>
   <button id="btnTheme" title="昼夜切换">◐</button>
   <button id="btnAdmin">管理</button>
@@ -1153,6 +1290,18 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 <main>
   <div id="view" class="muted">先登录，再新建或选择一本书。</div>
 </main>
+</div>
+<div id="statusBar"></div>
+<div id="modelPane" style="display:none">
+  <div class="card" style="max-width:460px;width:94%">
+    <b>🧠 模型设置</b> <span class="muted small" id="mModelTag"></span>
+    <label>服务商</label><select id="mProvider"><option value="openai">OpenAI 兼容（OpenRouter/自建/其他）</option><option value="cf-ai">Cloudflare Workers AI</option></select>
+    <label>API 地址</label><input id="mBase" placeholder="https://openrouter.ai/api/v1">
+    <label>模型</label><input id="mModel" placeholder="如 deepseek/deepseek-chat-v3-0324">
+    <label>API Key（留空=保持原值 / 用站点默认）</label><input id="mKey" type="password" placeholder="sk-...">
+    <div class="row"><button class="primary" id="mTest">🔌 测试连通</button><button class="primary" id="mSave">保存</button><button id="mCancel">关闭</button></div>
+    <div id="mMsg" class="muted small" style="margin-top:6px"></div>
+  </div>
 </div>
 <div id="authPane">
   <div class="card">
@@ -1171,7 +1320,9 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 <script>
 let TK=localStorage.getItem('nvs_token')||'', EMAIL=localStorage.getItem('nvs_email')||'', ADMIN=null, BK=null, TAB='chapters';
 const $=s=>document.querySelector(s);
-function toast(m,t){const d=document.createElement('div');d.className='card '+(t==='bad'?'':'');d.style.animation='none';d.innerHTML=m;$('#view').prepend(d);setTimeout(()=>d.remove(),4000);}
+// 状态栏：页底常驻反馈条（最近一次操作结果，成功绿/失败红）
+function toast(m,t){const sb=$('#statusBar');sb.innerHTML=(t==='bad'?'<span class="sbBad">✗ </span>':'<span class="sbOk">✓ </span>')+m+'<button id="sbClose" style="float:right;margin-left:10px;border:none;background:none;cursor:pointer">× 收起</button>';sb.style.display='block';const c=$('#sbClose');if(c)c.onclick=()=>{sb.style.display='none'};clearTimeout(toast._t);toast._t=setTimeout(()=>{sb.style.display='none'},t==='bad'?8000:4000)}
+function status(msg,kind){const sb=$('#statusBar');if(kind==='hide'){sb.style.display='none';return}sb.style.display='block';sb.innerHTML=kind==='busy'?'<span>⏳ '+msg+'</span>':(kind==='bad'?'<span class="sbBad">✗ '+msg+'</span>':'<span class="sbOk">✓ '+msg+'</span>');clearTimeout(status._t);if(kind!=='busy')status._t=setTimeout(()=>{sb.style.display='none'},6000)}
 async function api(path,opt={}){
   const r=await fetch(path,{method:opt.method||'GET',headers:{'Content-Type':'application/json',...(TK?{Authorization:'Bearer '+TK}:{})},body:opt.body?JSON.stringify(opt.body):undefined});
   let b;try{b=await r.json()}catch{b={}}
@@ -1187,12 +1338,42 @@ setTheme(localStorage.getItem('nvs_theme')||'night');
 $('#btnTheme').onclick=()=>setTheme(document.documentElement.getAttribute('data-theme')==='day'?'night':'day');
 
 // ---- 认证 ----
-function setAuthUI(logged){ $('#btnAuth').style.display=logged?'none':''; $('#btnOut').style.display=logged?'':'none'; $('#who').textContent=logged?EMAIL:''; }
+function setAuthUI(logged){ $('#btnAuth').style.display=logged?'none':''; $('#btnOut').style.display=logged?'':'none'; $('#who').textContent=logged?EMAIL:''; $('#btnModel').style.display=logged?'':'none'; }
+// 当前模型标签（header「🧠 模型」按钮上随时可见现在用的哪个模型）
+async function refreshModelTag(){
+  if(!TK)return;
+  const s=await api('/api/settings').catch(()=>null);if(!s)return;
+  $('#btnModel').innerHTML='🧠 '+(s.model||'未配模型').slice(0,24)+(s.using==='site'?' <span class="badge">站点</span>':'');
+}
+// 模型设置面板（需求④：登录后随时可改模型，不用找管理员）
+async function openModelPane(){
+  const s=await api('/api/settings').catch(()=>({}));
+  $('#mProvider').value=s.provider||'openai';$('#mBase').value=s.base_url||'';$('#mModel').value=s.model||'';$('#mKey').value='';
+  $('#mModelTag').textContent=s.using==='site'?'（当前用站点默认，填了保存即为你自己的）':'（你自己的配置）';
+  $('#mMsg').textContent='';$('#modelPane').style.cssText='display:grid;position:fixed;inset:0;z-index:55;place-items:center;background:rgba(0,0,0,.55)';
+}
+$('#btnModel').onclick=openModelPane;
+$('#mCancel').onclick=()=>{$('#modelPane').style.display='none'};
+$('#mSave').onclick=async()=>{
+  status('保存模型配置…','busy');
+  try{
+    await api('/api/settings',{method:'POST',body:{provider:$('#mProvider').value,base_url:$('#mBase').value,model:$('#mModel').value,api_key:$('#mKey').value}});
+    toast('模型已保存：'+($('#mModel').value||'默认'));$('#modelPane').style.display='none';refreshModelTag();
+  }catch(e){toast(e.message,'bad')}
+};
+$('#mTest').onclick=async()=>{
+  $('#mMsg').textContent='⏳ 测试中…';
+  try{
+    const r=await api('/api/settings/test',{method:'POST',body:{provider:$('#mProvider').value,base_url:$('#mBase').value,model:$('#mModel').value,api_key:$('#mKey').value}});
+    $('#mMsg').innerHTML=r.ok?'<span style="color:var(--ok)">✓ 连通正常（'+r.model+'，'+r.ms+'ms）'+(r.reply?'，回复：'+r.reply:'')+'</span>':'<span style="color:var(--bad)">✗ '+(r.error||'测试失败')+'</span>';
+  }catch(e){$('#mMsg').innerHTML='<span style="color:var(--bad)">✗ '+e.message+'</span>'}
+};
 async function afterLogin(){
   const me=await api('/api/me').catch(()=>({}));EMAIL=me.email||EMAIL;save();
   if(me.site_name)$('#siteName').textContent=me.site_name;
-  if(me.announcement)toast('<b>公告</b><br>'+me.announcement);
+  if(me.announcement)toast('<b>公告</b> '+me.announcement);
   $('#authPane').style.display='none';$('#dataPane').style.display='';setAuthUI(true);
+  refreshModelTag();
   await loadBooks();
 }
 $('#btnAuth').onclick=()=>showLogin();
@@ -1217,9 +1398,13 @@ async function openBook(id,title){
   const main=$('#view');
   main.innerHTML=\`
   <div class="card"><b>\${d.book.title}</b> <span class="badge">\${d.book.genre||'未分题材'}</span>
+    <div class="muted small" style="margin:6px 0">
+      写作链路：<b>1</b> 建设定（世界观/角色/伏笔）→ <b>2</b> 出大纲 → <b>3</b> 一键写下一章 → <b>4</b> 看章节结果 → <b>5</b> 导出成书。
+      第一次建议顺序做；设定越全，后写的章越不跑偏。
+    </div>
     <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vOutline">生成大纲</button><button id="vExpand">扩设定</button><button id="vAnti">AI味清单</button><button id="vExport">导出小说</button></div>
-    <div class="small muted">一致性四层：状态包（账本/声纹/卷摘）→ 起草 → 校验闭环 → 五维审查 · 润色去AI味 · 事实提取回写</div>
-    \${d.book.world_setting?\`<details><summary><b>世界观设定</b></summary><pre>\${d.book.world_setting}</pre></details>\`:''}
+    <div class="small muted">模式区别：标准=全套 6 步（最稳）· 快速=省掉部分审查（更快）· 极简=只起草+存档（最便宜，先试水用）。写完可导出 TXT/MD/HTML/EPUB。</div>
+    \${d.book.world_setting?\`<details><summary><b>世界观设定</b></summary><pre>\${d.book.world_setting}</pre></details>\`:\`<details class="muted"><summary>还没有世界观设定：点「扩设定」让 AI 帮你补，或在「伏笔/角色」标签里先把人立住</summary></details>\`}
     \${d.book.characters?\`<details><summary><b>角色设定</b></summary><pre>\${d.book.characters}</pre></details>\`:''}
   </div>
   <div class="tabbar">
@@ -1399,81 +1584,202 @@ async function showExportPanel(){
   };
 }
 
-// ---- 6 步流水线 UI ----
+// ---- 6 步流水线 UI（通俗版：横向步骤条 + 每步白话说明 + 状态栏忙碌提示） ----
 async function runPipe(mode){
   const p=$('#pipePanel');p.style.display='';
-  p.innerHTML=\`<div class="card"><b>⚡ 写章流水线（\${mode}）</b><div class="progress"><i id="ppBar" style="width:0%"></i></div><div id="stageList">准备…</div></div>\`;
-  const stages=['① 任务书','② 起草','②.5 校验闭环','③ 五维审查','④ 润色','⑤ 事实提取','⑥ 确定性回写'];
-  const setStage=i=>{stages.slice(0,i).forEach(s=>0);$('#stageList').innerHTML=stages.map((s,j)=>\`<div>\${j<i?'✅':'⏳'} \${s}</div>\`).join('')+'<div class="muted small">运行中… 约 1-3 分钟，请勿刷新</div>';$('#ppBar').style.width=((i+0.5)/stages.length*100)+'%'};
-  setStage(0);
+  const modeZh={standard:'标准（全 6 步）',fast:'快速（省部分审查）',minimal:'极简（只起草+回写）'}[mode]||mode;
+  const steps=[
+    ['任务书','先想清楚这章要写什么、谁出场、节奏怎么走'],
+    ['起草','把这一章正文写出来'],
+    ['一致性检查','和既有事实/角色状态对账，有矛盾就重写'],
+    ['五维审查','设定/剧情/角色/节奏/钩子 逐项打分'],
+    ['润色去AI味','按负面清单改文风，删套话'],
+    ['事实回写','提取本章新事实存入账本，更新角色/伏笔'],
+  ];
+  let curStep=0,done=false,fail=false;
+  const stepHTML=()=>steps.map((s,jj)=>\`<div class="st \${curStep>jj?'done':''} \${curStep===jj&&!done&&!fail?'on':''} \${curStep>jj||done?'done':''} \${curStep===jj&&fail?'fail':''}">\${jj+1}、\${s[0]}<div class="small">\${s[1]}</div></div>\`).join('');
+  const paint=()=>{$('#ppSteps').innerHTML=stepHTML();$('#ppBar').style.width=done?'100%':(Math.min(curStep+0.5,steps.length)/steps.length*100)+'%'};
+  p.innerHTML=\`<div class="card"><b>⚡ 写下一章（\${modeZh}）</b>
+    <div class="muted small">预计 1-3 分钟，请勿刷新页面。进行到哪一步看下面：</div>
+    <div class="steps" id="ppSteps">\${stepHTML()}</div>
+    <div class="progress"><i id="ppBar" style="width:0%"></i></div>
+    <div id="stageList" class="muted small">准备中…</div></div>\`;
+  status('写章中：第 1/6 步 任务书','busy');
+  paint();
   try{
     const r=await api(\`/api/books/\${BK}/pipeline\`,{method:'POST',body:{mode,words:2000}});
-    $('#ppBar').style.width='100%';
+    done=true;curStep=steps.length;paint();
+    status('','hide');
     const rc=r.review||{};
-    p.innerHTML=\`<div class="card"><b>✅ 第\${r.seq}章「\${r.title}」</b> <span class="badge \${r.status==='committed'?'ok':'bad'}">\${r.status==='committed'?'已回写 committed':'rejected（有阻断）'}</span>
-      <span class="badge">\${r.ms}ms</span><span class="badge">\${r.fixed} 处阻断已修</span>
-      <span class="badge">\${r.verifyConflicts||0} 处一致性冲突\${r.verifyRegenerated?'（已重生成）':''}</span>
-      <span class="badge">埋\${r.loopsPlanted}/收\${r.loopsRecycled} 伏笔</span><span class="badge">\${r.events} 条事件</span><span class="badge">账本 +\${r.extraction?.facts?.length||0}</span>
-      \${r.hasPlaceholder?'<span class="badge bad">检测到占位符，已降级</span>':''}
-      <div class="row">\${['standard','fast','minimal'].map(m=>\`<button data-rerun="\${m}">⚡ 再写下一章（\${m==='standard'?'标准':m==='fast'?'快速':'极简'}）</button>\`).join('')}</div>
+    p.innerHTML=\`<div class="card"><b>✅ 第\${r.seq}章「\${r.title}」写完</b>
+      <div class="resbar">
+        <span class="badge \${r.status==='committed'?'ok':'bad'}">\${r.status==='committed'?'已存进章节列表':'有硬伤，标为待处理'}</span>
+        <span class="badge">用时 \${(r.ms/1000).toFixed(0)} 秒</span>
+        <span class="badge">\${r.fixed} 处硬伤已自动修</span>
+        <span class="badge">矛盾 \${r.verifyConflicts||0} 处\${r.verifyRegenerated?'（已重写）':''}</span>
+        <span class="badge">新伏笔 \${r.loopsPlanted} / 回收 \${r.loopsRecycled}</span>
+        <span class="badge">账本 +\${r.extraction?.facts?.length||0} 条事实</span>
+        \${r.hasPlaceholder?'<span class="badge bad">检测到占位符，已降级</span>':''}
+      </div>
+      <div class="row">\${['standard','fast','minimal'].map(m=>\`<button data-rerun="\${m}">⚡ 再写下一章（\${{standard:'标准',fast:'快速',minimal:'极简'}[m]}）</button>\`).join('')}</div>
       <details><summary>正文</summary><pre>\${r.content}</pre></details>
       \${rc.issues?.length?\`<details><summary>审查（\${rc.issues_count} 项）</summary><pre>\${JSON.stringify(rc,null,1).slice(0,800)}</pre></details>\`:''}
-      <details><summary>摘要 / 钩子</summary><pre>\${r.summary||'(空)'}\${r.hook?'\\n钩：'+r.hook:''}</pre></details>
-      <div class="muted small">切到「伏笔/事件流/角色」标签查看回写结果；紧急伏笔会自动进入下一章任务书。</div>
+      <details><summary>摘要 / 钩子</summary><pre>\${r.summary||'(空)'}\${r.hook?'\\\\n钩：'+r.hook:''}</pre></details>
+      <div class="muted small">去「章节」标签看结果；「事实账本」「角色」标签里能看到刚回写的内容。</div>
     </div>\`;
     p.querySelectorAll('[data-rerun]').forEach(b=>b.onclick=()=>runPipe(b.dataset.rerun));
-    // 刷新章节列表
     if(TAB==='chapters')tabChapters();
-  }catch(e){p.innerHTML=\`<div class="card bad"><b>流水线失败</b><div>\${e.message}</div></div>\`}
+    toast('第'+r.seq+'章已写完'+(r.status==='committed'?'，自动存档':'，有硬伤需处理'));
+  }catch(e){
+    fail=true;paint();
+    status('','hide');
+    toast('写章失败：'+e.message,'bad');
+    p.innerHTML=\`<div class="card"><b>✗ 写章失败</b><div>\${e.message}</div>
+      <div class="muted small">常见原因：模型没配置 / Key 失效。点顶部「🧠 模型」检查并测试连通。</div></div>\`;
+  }
 }
 
-// ---- 管理端 ----
+// ---- 管理端（正规化：分标签管理后台 概览/会员/注册码/模型管理/站点&SEO） ----
 const admtok=()=>localStorage.getItem('nvs_admin_token');
 async function admFetch(path,method,body){const r=await fetch(path,{method:method||'GET',headers:{'Content-Type':'application/json',Authorization:'Bearer '+admtok()},body:body?JSON.stringify(body):undefined});if(!r.ok)throw new Error('管理员请求失败 HTTP '+r.status);return r.json().catch(()=>({}))}
+let ADMTAB='overview';
 async function openAdmin(){
   const main=$('#view');
-  main.innerHTML=\`<div class="card"><b>管理员</b><div class="row">
-    <input id="aEmail" placeholder="admin@x.com" style="width:200px"><input id="aPass" type="password" placeholder="密码" style="width:150px">
-    <button class="primary" id="aLogin">登录</button><button id="aInit">初始化首个管理员</button></div>
+  if(admtok()){ADMTAB='overview';await showAdmin();return}
+  main.innerHTML=\`<div class="card" style="max-width:420px"><b>管理员登录</b>
+    <label>管理员邮箱</label><input id="aEmail" placeholder="admin@x.com">
+    <label>密码</label><input id="aPass" type="password" placeholder="密码">
+    <div class="row"><button class="primary" id="aLogin">登录</button><button id="aInit">初始化首个管理员</button></div>
     <div id="aMsg" class="muted small"></div>
-    <div id="aBody" style="display:none"></div>
+    <div class="muted small" style="margin-top:8px">提示：还没初始化过管理员的话，填一个邮箱 + 至少 8 位密码，点「初始化首个管理员」。</div>
   </div>\`;
-if(admtok()){showAdmin();return}
-  const doLogin=init=>{const b=async()=>{$('#aMsg').textContent='登录中…';try{const r=await admFetch(init?'/api/admin/init':'/api/admin/login','POST',{email:$('#aEmail').value,password:$('#aPass').value});if(r.token)localStorage.setItem('nvs_admin_token',r.token);$('#aMsg').textContent='';await showAdmin()}catch(e){$('#aMsg').textContent=e.message}};b()};
+  const doLogin=init=>{const b=async()=>{$('#aMsg').textContent='登录中…';try{const r=await admFetch(init?'/api/admin/init':'/api/admin/login','POST',{email:$('#aEmail').value,password:$('#aPass').value});if(r.token)localStorage.setItem('nvs_admin_token',r.token);toast('管理员登录成功');await showAdmin()}catch(e){$('#aMsg').textContent=e.message}};b()};
   $('#aLogin').onclick=()=>doLogin(false);$('#aInit').onclick=()=>doLogin(true);
   window._showAdmin=showAdmin;
-  async function showAdmin(){
-    let st={users:0,books:0,chapters:0,usage7d:0,open_loops:0,free_codes:0};
-    let users=[], codes={codes:[],require_invite:true}, site={};
-    try{st=await admFetch('/api/admin/stats','GET')}catch{}
-    try{users=await admFetch('/api/admin/users','GET')}catch{users=[]}
-    if(!Array.isArray(users))users=[];
-    try{codes=await admFetch('/api/admin/codes','GET')}catch{}
-    if(!codes||!Array.isArray(codes.codes))codes={codes:[],require_invite:!!st.require_invite};
-    try{site=await admFetch('/api/admin/settings','GET')}catch{}
-    $('#aBody').style.display='';
-    $('#aBody').innerHTML=\`
-    <div class="row"><b>站点</b> 用户 \${st.users} · 书 \${st.books} · 章 \${st.chapters} · 7日用量 \${st.usage7d} · 未回收伏笔 \${st.open_loops} · 可用注册码 \${st.free_codes}</div>
-    <div class="card"><b>站点默认 AI 味负面清单</b>（书级清单为空时全局兜底；写章/润色/校验全链路生效）
-      <textarea id="aAnti" rows="4" style="width:100%">\${escH(site.anti_ai_default||'')}</textarea>
-      <div class="row"><button class="primary" id="aAntiSave">保存</button></div></div>
-    <div class="card"><b>注册码</b> <label class="row"><input type="checkbox" id="aReq" \${codes.require_invite?'checked':''}> 要求注册码</label>
-      <div class="row"><button class="primary" id="aGen">生成 5 个码</button></div>
-      <div class="thumbs" id="aCodes"></div></div>
-    <div class="card"><b>用户</b><table><tr><th>邮箱</th><th>书</th><th>AI调用</th><th>状态</th><th></th></tr>
-      \${users.map(u=>\`<tr><td>\${u.email}</td><td>\${u.books}</td><td>\${u.ai_calls||0}</td><td>\${u.blocked?'<span class="badge bad">停用</span>':'<span class="badge ok">正常</span>'}</td>
-      <td><button class="ub" data-e="\${u.email}">\${u.blocked?'解禁':'停用'}</button></td></tr>\`).join('')||'<tr><td colspan="5" class="muted">无用户</td></tr>'}</table></div>\`;
-    $('#aCodes').innerHTML=codes.codes.map(c=>\`<span class="badge \${c.revoked?'bad':c.used_by?'':'ok'}">\${c.code}\${c.used_by?' ←'+c.used_by:''}</span>\`).join(' ');
-    $('#aGen').onclick=async()=>{try{const d=await admFetch('/api/admin/codes','POST',{count:5,require:$('#aReq').checked});toast('已生成：<pre>'+(d.codes||[]).join('<br>')+'</pre>（发给用户注册）');await showAdmin()}catch(e){toast(e.message,'bad')}};
-    $('#aAntiSave').onclick=async()=>{try{await admFetch('/api/admin/settings','POST',{anti_ai_default:$('#aAnti').value});toast('已保存站点默认 AI 味清单');await showAdmin()}catch(e){toast(e.message,'bad')}};
-    $('#aReq').onchange=async()=>{try{await admFetch('/api/admin/settings','POST',{require_invite:$('#aReq').checked?1:0});await showAdmin()}catch(e){toast(e.message,'bad')}};
-    document.querySelectorAll('.ub').forEach(b=>b.onclick=async()=>{try{await admFetch('/api/admin/users/'+encodeURIComponent(b.dataset.e)+'/flag','POST',{blocked:b.textContent==='停用'?'1':'0'});await showAdmin()}catch(e){toast(e.message,'bad')}});
-  }
+}
+async function showAdmin(){
+  const main=$('#view');
+  const tabs=[['overview','📊 概览'],['users','👥 会员管理'],['codes','🎫 注册码'],['llm','🧠 模型管理'],['site','⚙️ 站点 & SEO']];
+  main.innerHTML=\`<div class="tabbar">
+    \${tabs.map(t=>\`<button data-atab="\${t[0]}" class="tb \${t[0]===ADMTAB?'on':''}">\${t[1]}</button>\`).join('')}
+    <button data-atab="__out" style="margin-left:auto">管理员退出</button>
+  </div><div id="aBody"></div>\`;
+  main.querySelectorAll('[data-atab]').forEach(b=>b.onclick=async()=>{
+    if(b.dataset.atab==='__out'){localStorage.removeItem('nvs_admin_token');toast('管理员已退出');return}
+    ADMTAB=b.dataset.atab;main.querySelectorAll('[data-atab]').forEach(x=>x.classList.toggle('on',x.dataset.atab===ADMTAB));
+    await adminTab();
+  });
+  await adminTab();
+}
+async function adminTab(){
+  if(ADMTAB==='overview')return adminOverview();
+  if(ADMTAB==='users')return adminUsers();
+  if(ADMTAB==='codes')return adminCodes();
+  if(ADMTAB==='llm')return adminLlm();
+  if(ADMTAB==='site')return adminSite();
+}
+// 概览：关键数字 + 活跃用户排行
+async function adminOverview(){
+  const body=$('#aBody');
+  let st={users:0,books:0,chapters:0,usage7d:0,open_loops:0,free_codes:0},top=[];
+  try{st=await admFetch('/api/admin/stats');top=st.top_users||[]}catch{}
+  const card=(n,l)=>\`<div class="card" style="min-width:120px"><div style="font-size:22px;font-weight:700">\${n}</div><div class="muted small">\${l}</div></div>\`;
+  body.innerHTML=\`<div class="row">\${card(st.users,'注册用户')}\${card(st.books,'书')}\${card(st.chapters,'章节')}\${card(st.usage7d,'7天AI调用')}\${card(st.open_loops,'未回收伏笔')}\${card(st.free_codes,'可用注册码')}</div>
+  <div class="card"><b>近 7 天最活跃用户</b>\${top.length?'<table><tr><th>邮箱</th><th>调用次数</th></tr>'+top.map(u=>\`<tr><td>\${u.user_email}</td><td>\${u.n}</td></tr>\`).join('')+'</table>':'<div class="muted">暂无数据</div>'}</div>
+  <div class="muted small">提示：会员操作去「👥 会员管理」；配置 AI 模型去「🧠 模型管理」；改站点名称/公告/SEO 去「⚙️ 站点 & SEO」。</div>\`;
+}
+// 会员管理：编辑/改密/禁用/删除
+async function adminUsers(){
+  const body=$('#aBody');
+  let users=[];
+  try{users=await admFetch('/api/admin/users')}catch{toast('加载用户失败','bad')}
+  if(!Array.isArray(users))users=[];
+  body.innerHTML=\`<div class="card"><b>会员（\${users.length}）</b>
+  \${users.length?'<table><tr><th>邮箱</th><th>注册于</th><th>书</th><th>AI调用</th><th>状态</th><th>操作</th></tr>'+users.map(u=>\`
+    <tr><td>\${u.email}</td><td class="muted small">\${(u.created_at||'').slice(0,10)}</td><td>\${u.books}</td><td>\${u.ai_calls||0}</td>
+    <td>\${u.blocked?'<span class="badge bad">已禁用</span>':'<span class="badge ok">正常</span>'}</td>
+    <td class="small"><button class="ue" data-e="\${u.email}">改密</button>
+    <button class="uf" data-e="\${u.email}" data-b="\${u.blocked?0:1}">\${u.blocked?'解禁':'禁用'}</button>
+    <button class="danger ud" data-e="\${u.email}">删除</button></td></tr>\`).join('')+'</table>':'<div class="muted">还没有用户</div>'}</div>\`;
+  body.querySelectorAll('.ue').forEach(b=>b.onclick=async()=>{
+    const p=prompt(\`给 \${b.dataset.e} 设置新密码（至少 6 位；留空取消）：\`);
+    if(!p)return;
+    try{await admFetch('/api/admin/users/'+encodeURIComponent(b.dataset.e),'POST',{password:p});toast('密码已更新，该用户下次登录生效');}catch(e){toast(e.message,'bad')}
+  });
+  body.querySelectorAll('.uf').forEach(b=>b.onclick=async()=>{
+    try{await admFetch('/api/admin/users/'+encodeURIComponent(b.dataset.e)+'/flag','POST',{blocked:b.dataset.b});toast(b.dataset.b==='1'?'已禁用（其登录被拒）':'已解禁');await adminUsers()}catch(e){toast(e.message,'bad')}
+  });
+  body.querySelectorAll('.ud').forEach(b=>b.onclick=async()=>{
+    if(!confirm(\`删除 \${b.dataset.e}？\\n会同时删除 TA 的所有书/章节/角色等数据，且注册码会释放。此操作不可恢复！\`))return;
+    try{const r=await admFetch('/api/admin/users/'+encodeURIComponent(b.dataset.e),'DELETE');toast('已删除（'+(r.books_removed||0)+' 本书一并清除）');await adminUsers()}catch(e){toast(e.message,'bad')}
+  });
+}
+// 注册码
+async function adminCodes(){
+  const body=$('#aBody');
+  let codes={codes:[],require_invite:true};
+  try{codes=await admFetch('/api/admin/codes')}catch{}
+  if(!Array.isArray(codes.codes))codes.codes=[];
+  body.innerHTML=\`<div class="card"><b>注册码</b>
+    <label class="row"><input type="checkbox" id="aReq" \${codes.require_invite?'checked':''}> 注册需要注册码（关掉则任何人可注册）</label>
+    <div class="row">生成 <input id="aCnt" type="number" min="1" max="50" value="5" style="width:70px"> 个 <button class="primary" id="aGen">生成</button></div>
+    <div class="muted small">灰=未使用 · 带 ←邮箱=已被注册 · 红=已作废</div>
+    <div class="thumbs" id="aCodes" style="margin-top:8px">\${codes.codes.map(c=>\`<span class="badge \${c.revoked?'bad':c.used_by?'':'ok'}">\${c.code}\${c.used_by?' ←'+c.used_by:''}</span>\`).join(' ')||'<span class="muted">暂无</span>'}</div></div>\`;
+  body.querySelector('#aReq').onchange=async e=>{try{await admFetch('/api/admin/settings','POST',{require_invite:e.target.checked?1:0});toast('已保存')}catch(x){toast(x.message,'bad')}};
+  body.querySelector('#aGen').onclick=async()=>{try{const d=await admFetch('/api/admin/codes','POST',{count:+body.querySelector('#aCnt').value||5});toast('已生成：'+(d.codes||[]).join(' '));await adminCodes()}catch(e){toast(e.message,'bad')}};
+}
+// 模型管理（站点默认 LLM）
+async function adminLlm(){
+  const body=$('#aBody');
+  let s={provider:'openai',base_url:'',model:'',has_key:false};
+  try{s=await admFetch('/api/admin/llm')}catch{}
+  body.innerHTML=\`<div class="card"><b>站点默认模型</b>
+    <div class="muted small">用户没配自己的模型时，全站用这里这套。填好后点「测试连通」再保存。</div>
+    <label>服务商</label><select id="lProv"><option value="openai" \${s.provider==='openai'?'selected':''}>OpenAI 兼容（OpenRouter / 自建代理 / 其他）</option><option value="cf-ai" \${s.provider==='cf-ai'?'selected':''}>Cloudflare Workers AI</option></select>
+    <label>API 地址</label><input id="lBase" value="\${escH(s.base_url)}" placeholder="https://openrouter.ai/api/v1">
+    <label>模型</label><input id="lModel" value="\${escH(s.model)}" placeholder="如 deepseek/deepseek-chat-v3-0324">
+    <label>API Key\${s.has_key?'（已有 Key，留空保持不变）':''}</label><input id="lKey" type="password" placeholder="sk-...">
+    <div class="row"><button class="primary" id="lTest">🔌 测试连通</button><button class="primary" id="lSave">保存</button></div>
+    <div id="lMsg" class="muted small"></div>
+    <div class="muted small" style="margin-top:6px">注：用户端在右上角「🧠 模型」按钮里填了自己的配置，会优先用自己的，不走这里。</div></div>\`;
+  const cur=()=>({provider:$('#lProv').value,base_url:$('#lBase').value,model:$('#lModel').value,api_key:$('#lKey').value});
+  $('#lTest').onclick=async()=>{$('#lMsg').textContent='⏳ 测试中…';try{const r=await admFetch('/api/admin/llm/test','POST',cur());$('#lMsg').innerHTML=r.ok?\`<span style="color:var(--ok)">✓ 连通正常（\${r.model}，\${r.ms}ms）</span>\`:\`<span style="color:var(--bad)">✗ \${r.error}</span>\`}catch(e){$('#lMsg').textContent='✗ '+e.message}};
+  $('#lSave').onclick=async()=>{try{await admFetch('/api/admin/llm','POST',cur());toast('站点默认模型已保存');await adminLlm()}catch(e){toast(e.message,'bad')}};
+}
+// 站点 & SEO
+async function adminSite(){
+  const body=$('#aBody');
+  let site={};
+  try{site=await admFetch('/api/admin/settings')}catch{}
+  body.innerHTML=\`<div class="card"><b>站点设置</b>
+    <label>站点名称（显示在顶栏）</label><input id="sName" value="\${escH(site.site_name||'')}">
+    <label>公告（用户登录后弹一次，可空）</label><input id="sAnn" value="\${escH(site.announcement||'')}">
+    <div class="row"><button class="primary" id="sSave">保存站点设置</button></div></div>
+  <div class="card"><b>SEO（搜索引擎展示文案）</b>
+    <div class="muted small">用户访问时注入到页面 head；搜索结果里显示的描述/关键词在这里改。</div>
+    <label>页面描述 meta description</label><textarea id="sDesc" rows="2">\${escH(site.seo_desc||'')}</textarea>
+    <label>关键词 meta keywords</label><input id="sKw" value="\${escH(site.seo_keywords||'')}">
+    <div class="row"><button class="primary" id="sSeoSave">保存 SEO</button></div></div>
+  <div class="card"><b>站点默认 AI 味负面清单</b>
+    <div class="muted small">书没配自己的清单时，写章/润色/校验全链路用这份。</div>
+    <textarea id="sAnti" rows="4">\${escH(site.anti_ai_default||'')}</textarea>
+    <div class="row"><button class="primary" id="sAntiSave">保存清单</button></div></div>\`;
+  $('#sSave').onclick=async()=>{try{await admFetch('/api/admin/settings','POST',{site_name:$('#sName').value,announcement:$('#sAnn').value});toast('站点设置已保存')}catch(e){toast(e.message,'bad')}};
+  $('#sSeoSave').onclick=async()=>{try{await admFetch('/api/admin/settings','POST',{seo_desc:$('#sDesc').value,seo_keywords:$('#sKw').value});toast('SEO 已保存（下次刷新页面生效）')}catch(e){toast(e.message,'bad')}};
+  $('#sAntiSave').onclick=async()=>{try{await admFetch('/api/admin/settings','POST',{anti_ai_default:$('#sAnti').value});toast('AI 味清单已保存')}catch(e){toast(e.message,'bad')}};
 }
 $('#btnAdmin').onclick=()=>openAdmin();
 
+
 // ---- 启动 ----
 (async function init(){
+  // SEO：拉站点信息，注入 head 的 meta description/keywords（对搜索引擎可见）
+  api('/api/site').then(s=>{
+    if(s.site_name)$('#siteName').textContent=s.site_name;
+    const md=document.getElementById('metaDesc'),mk=document.getElementById('metaKw');
+    if(md&&s.seo_desc)md.setAttribute('content',s.seo_desc);
+    if(mk&&s.seo_keywords)mk.setAttribute('content',s.seo_keywords);
+  }).catch(()=>{});
   if(TK){try{await afterLogin()}catch{localStorage.removeItem('nvs_token');TK=''}}
   if(!TK)showLogin();
   // 管理按钮常显（BUG-3）；面板内部走 admin token 登录（BUG-4），不会死循环
@@ -1485,7 +1791,7 @@ function showLogin(){$('#authPane').style.display='grid';$('#dataPane').style.di
 
 // ---------- router ----------
 // 公开路由无需 token；/api/admin/* 需 admin token（Header Authorization: Bearer <admin_token>）；其余需用户 token
-const publicRoutes = ["POST /api/register", "POST /api/login"];
+const publicRoutes = ["GET /api/site", "POST /api/register", "POST /api/login"];
 const adminRoutes = ["POST /api/admin/init", "POST /api/admin/login"];
 
 export default {

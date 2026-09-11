@@ -262,6 +262,60 @@ await T("N6：流水线成功只记 1 条 usage（路由层单点记账）", asy
   assert(after - before === 1, `usage delta ${after - before}, expected 1`);
 });
 
+// ---- 新功能回归：站点信息 / 模型测试 / 站点默认 LLM / 会员编辑删除 ----
+await T("GET /api/site 公开返回 SEO + 站点名", async () => {
+  const r = await call("GET", "/api/site");
+  assert(r.status === 200 && r.body.site_name, JSON.stringify(r.body).slice(0, 120));
+  assert(r.body.seo_desc.includes("NVS"), "seo_desc missing");
+});
+
+await T("POST /api/settings/test：mock LLM 连通测试", async () => {
+  const r = await call("POST", "/api/settings/test", { provider: "openai", base_url: "http://127.0.0.1:8901/v1", model: "mock-model", api_key: "mock" }, tokA);
+  assert(r.status === 200 && r.body.ok === true, JSON.stringify(r.body).slice(0, 150));
+});
+
+await T("站点默认 LLM：admin 配置后未配 key 的用户回退生效", async () => {
+  const set = await call("POST", "/api/admin/llm", { provider: "openai", base_url: "http://127.0.0.1:8901/v1", model: "site-default-model", api_key: "sitekey" }, adminTok);
+  assert(set.status === 200, JSON.stringify(set.body));
+  const get = await call("GET", "/api/admin/llm", null, adminTok);
+  assert(get.status === 200 && get.body.model === "site-default-model" && get.body.has_key, JSON.stringify(get.body));
+  // 用户 B 从未配过自己的 key → /api/settings 应回退站点默认（using=site）
+  // （N4 中 B 被禁用过、旧 token 已清，先重新登录拿新 token）
+  const relog = await call("POST", "/api/login", { email: "b@test.dev", password: "pass456" });
+  assert(relog.status === 200, JSON.stringify(relog.body).slice(0, 100));
+  tokB = relog.body.token;
+  const s = await call("GET", "/api/settings", null, tokB);
+  assert(s.status === 200 && s.body.model === "site-default-model" && s.body.using === "site", JSON.stringify(s.body));
+  // 清掉站点默认，恢复出厂
+  await call("POST", "/api/admin/llm", { provider: "openai", base_url: "", model: "", api_key: "" }, adminTok);
+});
+
+await T("会员编辑：管理员改密 + 重置 token", async () => {
+  const r = await call("POST", "/api/admin/users/b%40test.dev", { password: "newpass789" }, adminTok);
+  assert(r.status === 200, JSON.stringify(r.body));
+  const l = await call("POST", "/api/login", { email: "b@test.dev", password: "newpass789" });
+  assert(l.status === 200, "login with new password failed: " + l.status);
+  const rt = await call("POST", "/api/admin/users/b%40test.dev", { reset_token: true }, adminTok);
+  assert(rt.status === 200, JSON.stringify(rt.body));
+  // 旧 token 应失效（改密时 token 已清空）
+  const old = await call("GET", "/api/books", null, tokB);
+  assert(old.status === 401, "stale token should 401 after password change, got " + old.status);
+});
+
+await T("会员删除：级联清理书/章/角色/账本，释放注册码", async () => {
+  // B 重新登录（改密后旧 token 已失效）拿新 token
+  const relog = await call("POST", "/api/login", { email: "b@test.dev", password: "newpass789" });
+  assert(relog.status === 200, JSON.stringify(relog.body).slice(0, 100));
+  const tokB2 = relog.body.token;
+  const b2 = await call("POST", "/api/books", { title: "B的书" }, tokB2);
+  assert(b2.status === 200, "create book failed: " + JSON.stringify(b2.body).slice(0, 100));
+  const del = await call("DELETE", "/api/admin/users/b%40test.dev", null, adminTok);
+  assert(del.status === 200 && del.body.books_removed === 1, JSON.stringify(del.body));
+  // 该用户再登录 → 401 账号不存在
+  const l = await call("POST", "/api/login", { email: "b@test.dev", password: "newpass789" });
+  assert(l.status === 401, "deleted user can still login: " + l.status);
+});
+
 mock.close();
 server.close();
 console.log(fail === 0 ? "\n全部通过 ✅" : `\n${fail} 项失败 ❌`);

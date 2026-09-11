@@ -161,6 +161,11 @@ INSERT OR IGNORE INTO settings(key,value) VALUES('site_name','NVS 写作台');
 INSERT OR IGNORE INTO settings(key,value) VALUES('announcement','');
 -- 站点默认 AI 味负面清单（书级 anti_ai_rules 为空时回退到此）
 INSERT OR IGNORE INTO settings(key,value) VALUES('anti_ai_default','禁止套话：不禁/仿佛/眼中闪过一丝/嘴角勾起一抹/值得注意的是/总而言之/命运的齿轮；禁止连续三个以上排比句；禁止解释性旁白（用动作与细节代替评论）；句式长短必须有变化；每个角色说话要有区分度（用词/信息量/口头禅不同）');
+-- SEO（meta description/keywords，前端启动时注入 head）
+INSERT OR IGNORE INTO settings(key,value) VALUES('seo_desc','NVS 写作台：AI 长篇网文流水线。设定集、伏笔、角色声纹、事实账本四层一致性，一键写章、五维审查、去 AI 味润色、EPUB 导出。');
+INSERT OR IGNORE INTO settings(key,value) VALUES('seo_keywords','AI写作,网络小说,长篇小说,写作助手,大纲,伏笔,EPUB导出');
+-- 站点级默认 LLM（JSON：{provider,base_url,model,api_key}；用户未配模型时回退到此）
+INSERT OR IGNORE INTO settings(key,value) VALUES('site_llm','');
 
 -- 用量统计
 CREATE TABLE IF NOT EXISTS ai_usage (
