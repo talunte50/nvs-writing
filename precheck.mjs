@@ -46,6 +46,7 @@ const must = [
   "btnAdmin", "authPane", "exportPanel", "showExportPanel", "editCh",
   "vExport", "btnLogin", "btnReg", "btnTheme", "runPipe", "openAdmin",
   "admFetch", "statusBar", "btnModel", "openModelPane", "adminUsers", "adminLlm", "adminSite",
+  "runPipeN", "openChatPane", "tabStats", "vPipeN", "vChat",
 ];
 for (const m of must) {
   if (!browserJs.includes(m)) throw new Error(`浏览器 JS 缺少关键符号：${m}`);
@@ -56,6 +57,7 @@ console.log("✓ 关键前端符号齐全");
 const routes = [
   "GET /api/books/:id/export", "POST /api/ai/outline", "POST /api/admin/init",
   "POST /api/admin/login", "GET /api/admin/stats", "POST /api/books/:id/pipeline",
+  "POST /api/books/:id/chat", "GET /api/books/:id/stats",
   "PATCH /api/chapters/:id", "POST /api/books/:id/chapters",
   "GET /api/site", "POST /api/settings/test", "GET /api/admin/llm", "POST /api/admin/llm",
   "POST /api/admin/users/:email", "DELETE /api/admin/users/:email",

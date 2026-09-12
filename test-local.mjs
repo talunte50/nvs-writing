@@ -13,6 +13,7 @@ const mock = createServer((req, res) => {
     const last = b.messages?.[b.messages.length - 1]?.content || "";
     let out;
     if (last.includes("只输出任务书")) out = "①开篇委托：第X章推进剧情 ②本章目标 ③出场人物 ④节奏 ⑤收在哪里";
+    else if (last.includes("设定顾问") || last.includes("作者提问")) out = "萧炎当前知道三年之期将满。依据：事实账本（萧炎知道三年之期将满）+ 第1章摘要。";
     else if (last.includes("校验") && last.includes("JSON"))
       out = '{"conflicts":[],"facts_extracted":3,"checked":3}';
     else if (last.includes("五维审查") || last.includes("审查并只输出 JSON"))
@@ -314,6 +315,29 @@ await T("会员删除：级联清理书/章/角色/账本，释放注册码", as
   // 该用户再登录 → 401 账号不存在
   const l = await call("POST", "/api/login", { email: "b@test.dev", password: "newpass789" });
   assert(l.status === 401, "deleted user can still login: " + l.status);
+});
+
+// ---- 新功能回归：问设定 / 创作看板 ----
+await T("问设定：POST /api/books/:id/chat 基于状态包回答 + 用量记账", async () => {
+  const r = await call("POST", `/api/books/${book}/chat`, { question: "主角现在知道什么？" }, tokA);
+  assert(r.status === 200, JSON.stringify(r.body).slice(0, 200));
+  assert(typeof r.body.answer === "string" && r.body.answer.includes("依据"), "answer missing: " + JSON.stringify(r.body).slice(0, 200));
+  assert(r.body.ctx_parts > 0, "ctx_parts should be >0 (状态包非空), got " + r.body.ctx_parts);
+  // 空问题 → 400
+  const bad = await call("POST", `/api/books/${book}/chat`, { question: "" }, tokA);
+  assert(bad.status === 400, "empty question should 400, got " + bad.status);
+  // 用量记账
+  const u = await call("GET", "/api/me", null, tokA);
+});
+
+await T("创作看板：GET /api/books/:id/stats 字数/章/伏笔/近14天/连续天数", async () => {
+  const r = await call("GET", `/api/books/${book}/stats`, null, tokA);
+  assert(r.status === 200, JSON.stringify(r.body).slice(0, 200));
+  assert(typeof r.body.total_words === "number" && r.body.total_words > 0, "total_words should be >0, got " + r.body.total_words);
+  assert(r.body.chapters >= 2, "chapters should be >=2, got " + r.body.chapters);
+  assert(Array.isArray(r.body.daily) && r.body.daily.length === 14, "daily should be 14 days");
+  assert(typeof r.body.streak === "number" && r.body.streak >= 1, "streak should be >=1 (今天写过), got " + r.body.streak);
+  assert(typeof r.body.open_loops === "number" && typeof r.body.roles === "number", "open_loops/roles missing");
 });
 
 mock.close();

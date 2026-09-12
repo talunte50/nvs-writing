@@ -1007,6 +1007,59 @@ Object.assign(api, {
     return json(result);
   },
 
+  // ---- 问设定（①）：基于本书上下文包回答作者提问；缺上下文会说"需要补充"而非编造 ----
+  "POST /api/books/:id/chat": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    const book = await bookOrNone(env, p, email);
+    if (!book) return json({ error: "book not found" }, 404);
+    const b = await req.json().catch(() => ({}));
+    const question = String(b.question || "").trim();
+    if (!question) return json({ error: "请填入问题" }, 400);
+    const s = await getLlm(env, email);
+    // 复用状态包（seq=999999 → 前情取最近 3 章；antiAiRules=null → 不附负面清单）
+    const statePack = await buildStatePack(env, book, { seq: 999999, words: 0 }, null);
+    const sys = "你是小说《" + book.title + "》的设定顾问，熟悉全书的世界观、角色档案、伏笔账本、事实账本与近章摘要。"
+      + "只依据【上下文包】回答作者的问题；答案末尾用一行「依据：」说明引用了哪些条目（世界观/角色/伏笔/账本/第N章摘要）。"
+      + "上下文里没有的信息，直接说「现有设定未覆盖，建议在设定或大纲中补充」，禁止编造。回答用中文，直接给结论不绕弯。";
+    const usr = "【上下文包】\n" + statePack.pack + "\n\n【作者提问】" + question.slice(0, 1000) + "\n\n请回答。";
+    let ok = true;
+    let out;
+    try {
+      out = await chat(env, s, [{ role: "system", content: sys }, { role: "user", content: usr }], { maxTokens: 2500, temperature: 0.3 });
+    } catch (e) { ok = false; out = "LLM 调用失败：" + String(e.message || e); }
+    await logUsage(env, email, "chat", ok);
+    return json({ answer: out, ctx_parts: statePack.pack ? statePack.pack.split("\n").filter(Boolean).length : 0 });
+  },
+
+  // ---- 创作看板（④）：字数/章数/未回收伏笔/角色/近14天写章分布/连续写作天数 ----
+  "GET /api/books/:id/stats": async (env, req, p, email) => {
+    if (!email) return json({ error: "unauthorized" }, 401);
+    if (!(await bookOrNone(env, p, email))) return json({ error: "not found" }, 404);
+    const [tot, open, nRoles, daily, dates] = await Promise.all([
+      env.DB.prepare("SELECT COUNT(*) c, COALESCE(SUM(LENGTH(content)),0) w FROM chapters WHERE book_id=?").bind(p.id).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM foreshadows WHERE book_id=? AND status='open'").bind(p.id).first(),
+      env.DB.prepare("SELECT COUNT(*) c FROM roles WHERE book_id=?").bind(p.id).first(),
+      env.DB.prepare("SELECT date(updated_at) d, COUNT(*) c FROM chapters WHERE book_id=? AND date(updated_at)>=date('now','-13 day') GROUP BY d").bind(p.id).all(),
+      env.DB.prepare("SELECT DISTINCT date(updated_at) d FROM chapters WHERE book_id=?").bind(p.id).all(),
+    ]);
+    const map = {};
+    (daily.results || []).forEach((r) => (map[r.d] = r.c));
+    const daily14 = [];
+    for (let k = 13; k >= 0; k--) {
+      const d = new Date(Date.now() - k * 864e5).toISOString().slice(0, 10);
+      daily14.push({ d, c: map[d] || 0 });
+    }
+    // 连续天数：今天有写算1起；今天没写则看昨天（否则中断）
+    const ds = new Set((dates.results || []).map((r) => r.d));
+    let probe = new Date();
+    let today = probe.toISOString().slice(0, 10);
+    if (!ds.has(today)) { probe.setDate(probe.getDate() - 1); if (!ds.has(probe.toISOString().slice(0, 10))) ds.delete("__none__"); }
+    let streak = 0;
+    while (ds.has(probe.toISOString().slice(0, 10))) { streak++; probe.setDate(probe.getDate() - 1); }
+    if (ds.has(today)) streak += 0; // 今天已计入（loop 从 today 或 yesterday 起数）
+    return json({ total_words: Number(tot.w) || 0, chapters: Number(tot.c) || 0, open_loops: Number(open.c) || 0, roles: Number(nRoles.c) || 0, daily: daily14, streak });
+  },
+
   // ---- 每用户 LLM 设置 ----
   "GET /api/settings": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
@@ -1402,22 +1455,23 @@ async function openBook(id,title){
       写作链路：<b>1</b> 建设定（世界观/角色/伏笔）→ <b>2</b> 出大纲 → <b>3</b> 一键写下一章 → <b>4</b> 看章节结果 → <b>5</b> 导出成书。
       第一次建议顺序做；设定越全，后写的章越不跑偏。
     </div>
-    <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vOutline">生成大纲</button><button id="vExpand">扩设定</button><button id="vAnti">AI味清单</button><button id="vExport">导出小说</button></div>
-    <div class="small muted">模式区别：标准=全套 6 步（最稳）· 快速=省掉部分审查（更快）· 极简=只起草+存档（最便宜，先试水用）。写完可导出 TXT/MD/HTML/EPUB。</div>
+    <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vPipeN">⏩ 连写N章</button><input id="vPipeNN" type="number" min="1" max="50" value="3" title="连写章数" style="width:60px"><button id="vChat">💬 问设定</button><button id="vOutline">生成大纲</button><button id="vExpand">扩设定</button><button id="vAnti">AI味清单</button><button id="vExport">导出小说</button></div>
+    <div class="small muted">模式区别：标准=全套 6 步（最稳）· 快速=省掉部分审查（更快）· 极简=只起草+存档（最便宜，先试水用）。写完可导出 TXT/MD/HTML/EPUB。连写=一次跑 N 章（每章独立过 6 步，可随时停）；问设定=带着全书设定/账本向 AI 提问。</div>
     \${d.book.world_setting?\`<details><summary><b>世界观设定</b></summary><pre>\${d.book.world_setting}</pre></details>\`:\`<details class="muted"><summary>还没有世界观设定：点「扩设定」让 AI 帮你补，或在「伏笔/角色」标签里先把人立住</summary></details>\`}
     \${d.book.characters?\`<details><summary><b>角色设定</b></summary><pre>\${d.book.characters}</pre></details>\`:''}
   </div>
   <div class="tabbar">
-    \${['chapters:章节','roles:角色','loops:伏笔','outline:大纲','events:事件流','ledger:事实账本','sums:卷摘要'].map(t=>{const k=t.split(':');return \`<button data-tab="\${k[0]}" class="tb \${k[0]===TAB?'on':''}">\${k[1]}</button>\`}).join('')}
+    \${['chapters:章节','roles:角色','loops:伏笔','outline:大纲','events:事件流','ledger:事实账本','sums:卷摘要','stats:📈看板'].map(t=>{const k=t.split(':');const openN=k[0]==='loops'?d.loops.filter(x=>x.status==='open').length:0;return '<button data-tab="'+k[0]+'" class="tb '+(k[0]===TAB?'on':'')+'">'+k[1]+(k[0]==='loops'&&openN?' <span class="badge warn">'+openN+'未收</span>':'')+'</button>'}).join('')}
   </div>
   <div id="tabBody"></div>
   <div id="pipePanel" style="display:none"></div><div id="exportPanel"></div>\`;
   main.querySelectorAll('.tb').forEach(b=>b.onclick=()=>{TAB=b.dataset.tab;main.querySelectorAll('.tb').forEach(x=>x.classList.toggle('on',x===b));renderTab()});
   $('#vPipe').onclick=()=>runPipe('standard');$('#vPipeFast').onclick=()=>runPipe('fast');$('#vPipeMin').onclick=()=>runPipe('minimal');
+  $('#vPipeN').onclick=()=>runPipeN();$('#vChat').onclick=openChatPane;
   $('#vOutline').onclick=genOutline;$('#vExpand').onclick=expandSetting;$('#vAnti').onclick=editAnti;$('#vExport').onclick=showExportPanel;
   await renderTab();
 }
-function renderTab(){return TAB==='chapters'?tabChapters():TAB==='roles'?tabRoles():TAB==='loops'?tabLoops():TAB==='outline'?tabOutline():TAB==='events'?tabEvents():TAB==='ledger'?tabLedger():tabSums()}
+function renderTab(){return TAB==='chapters'?tabChapters():TAB==='roles'?tabRoles():TAB==='loops'?tabLoops():TAB==='outline'?tabOutline():TAB==='events'?tabEvents():TAB==='ledger'?tabLedger():TAB==='stats'?tabStats():tabSums()}
 
 async function tabChapters(){
   const cs=await api(\`/api/books/\${BK}/chapters\`);
@@ -1637,6 +1691,89 @@ async function runPipe(mode){
     p.innerHTML=\`<div class="card"><b>✗ 写章失败</b><div>\${e.message}</div>
       <div class="muted small">常见原因：模型没配置 / Key 失效。点顶部「🧠 模型」检查并测试连通。</div></div>\`;
   }
+}
+
+// ---- 连写 N 章（②）：循环跑流水线，逐章刷新状态栏，可中途停 ----
+let _stopPipe=false;
+async function runPipeN(){
+  const n=Math.max(1,Math.min(50,parseInt($('#vPipeNN').value)||3));
+  _stopPipe=false;
+  const p=$('#pipePanel');p.style.display='';
+  p.innerHTML='<div class="card"><b>⏩ 连写 '+n+' 章（快速模式）</b>'
+    +'<div class="muted small">每章独立跑 6 步（快速），状态栏逐章刷新。共约 '+(n*2)+'-'+(n*4)+' 分钟。</div>'
+    +'<div id="pnList" class="muted small">开始…</div>'
+    +'<div class="row" style="margin-top:8px"><button id="pnStop">■ 停止连写</button></div></div>';
+  $('#pnStop').onclick=()=>{_stopPipe=true;$('#pnStop').textContent='正在停止…'};
+  let ok=0,faild=0;
+  for(let i=1;i<=n;i++){
+    if(_stopPipe)break;
+    status('连写中：第 '+i+'/'+n+' 章…','busy');
+    try{
+      const r=await api('/api/books/'+BK+'/pipeline',{method:'POST',body:{mode:'fast',words:2000}});
+      ok++;
+      $('#pnList').innerHTML+='<div>✅ 第'+r.seq+'章「'+(r.title||'')+'」'+(r.status==='committed'?'已存':'有硬伤')+'（'+(r.ms/1000).toFixed(0)+'s）</div>';
+    }catch(e){
+      faild++;
+      $('#pnList').innerHTML+='<div>✗ 第'+i+'章失败：'+escH(e.message)+'（后续已跳过，可单独补写）</div>';
+      if(e.codeRequired||/limit|429|timeout/i.test(e.message))break;
+    }
+    p.scrollTop=p.scrollHeight;
+  }
+  status('','hide');
+  $('#pnStop').style.display='none';
+  if(TAB==='chapters')tabChapters();
+  toast('连写结束：成功 '+ok+' 章'+(faild?'，失败 '+faild+' 章':'')+'。去「章节」标签看结果。',faild?'bad':'');
+}
+
+// ---- 问设定（①）：带着本书上下文包向 AI 提问（对标 chinese-novelist-skill 创作记忆问答） ----
+async function openChatPane(){
+  let pane=$('#chatPane');
+  if(!pane){pane=document.createElement('div');pane.id='chatPane';document.body.appendChild(pane)}
+  pane.style.cssText='display:grid;position:fixed;inset:0;z-index:56;place-items:center;background:rgba(0,0,0,.55)';
+  pane.innerHTML='<div class="card" style="max-width:620px;width:94%;max-height:80vh;overflow:auto">'
+    +'<b>💬 问设定</b> <span class="muted small">AI 基于本书的世界观/角色/伏笔/事实账本/近3章摘要回答；没问过的会说「需补充」不编造。</span>'
+    +'<div id="chatMsgs" class="small" style="margin:8px 0;max-height:40vh;overflow:auto"></div>'
+    +'<div class="row"><input id="chatQ" placeholder="例：主角现在知道哪些情报？" style="flex:1"><button class="primary" id="chatGo">问</button></div>'
+    +'<div class="row"><button id="chatClose">关闭</button></div>'
+    +'</div>';
+  $('#chatClose').onclick=()=>{pane.style.display='none'};
+  const q=$('#chatQ');
+  const ask=async()=>{
+    const question=q.value.trim();if(!question)return;
+    q.value='';const msgs=$('#chatMsgs');
+    msgs.innerHTML+='<div style="margin:6px 0"><b>Q：'+escH(question)+'</b><div id="chatLast" class="muted">…思考中</div></div>';
+    msgs.scrollTop=msgs.scrollHeight;
+    try{
+      const r=await api('/api/books/'+BK+'/chat',{method:'POST',body:{question}});
+      const el=$('#chatLast');el.innerHTML=escH(r.answer||'(无回答)');el.classList.remove('muted');
+    }catch(e){const el=$('#chatLast');el.innerHTML='<span style="color:var(--bad)">✗ '+escH(e.message)+'</span>'}
+    msgs.scrollTop=msgs.scrollHeight;
+  };
+  $('#chatGo').onclick=ask;
+  q.onkeydown=e=>{if(e.key==='Enter')ask()};
+  q.focus();
+}
+
+// ---- 创作看板（④）：字数/章数/伏笔/角色/连续天数/近14天写章分布 ----
+async function tabStats(){
+  const s=await api('/api/books/'+BK+'/stats').catch(()=>null);
+  if(!s){$('#tabBody').innerHTML='<div class="card muted">看板加载失败</div>';return}
+  const max=Math.max(1,...s.daily.map(x=>x.c));
+  const cols=s.daily.map(x=>'<div style="display:flex;flex-direction:column;align-items:center;flex:1;gap:3px">'
+    +'<div style="width:80%;height:'+Math.max(4,Math.round(x.c/max*64))+'px;background:var(--acc);opacity:'+(x.c?0.9:0.15)+';border-radius:2px" title="'+x.d+'：'+x.c+'章"></div>'
+    +'<div class="small muted">'+x.d.slice(5)+'</div>'
+    +'<div class="small">'+x.c+'</div></div>').join('');
+  $('#tabBody').innerHTML='<div class="card"><b>📈 创作看板</b>'
+    +'<div class="resbar" style="margin:8px 0">'
+    +'<span class="badge">总字数 '+s.total_words.toLocaleString()+'</span>'
+    +'<span class="badge">章节 '+s.chapters+'</span>'
+    +'<span class="badge '+(s.open_loops?'warn':'ok')+'">未回收伏笔 '+s.open_loops+'</span>'
+    +'<span class="badge">角色 '+s.roles+'</span>'
+    +'<span class="badge '+(s.streak>=3?'ok':'')+'">连续写作 '+s.streak+' 天</span></div>'
+    +'<div class="small muted" style="margin:4px 0">近 14 天写章分布（每天回写的章节数）</div>'
+    +'<div style="display:flex;align-items:flex-end;gap:6px;height:100px;margin:8px 0">'+cols+'</div>'
+    +'<div class="small muted">提示：未回收伏笔多时，写下一章会强制把紧急的带进任务书；也可以在「伏笔」标签里手动标记回收。</div>'
+    +'</div>'
 }
 
 // ---- 管理端（正规化：分标签管理后台 概览/会员/注册码/模型管理/站点&SEO） ----
