@@ -2,6 +2,12 @@
 
 单文件 Cloudflare Worker（Workers + D1，零构建）。AI 写作台：多书管理、章节编辑器自动保存、6 类 AI 动作（续写/重写/润色/摘要/下章钩子/章节大纲 + 扩展世界观/角色设定），上下文自动注入（梗概+世界观+角色+前情摘要，RAG-lite）。
 
+**四大进阶能力**（对标 chinese-novelist-skill / novel-studio / mythpen / AI_NovelGenerator）：
+- 💬 **问设定**：`POST /api/books/:id/chat`——带着本书状态包（世界观/角色/伏笔/事实账本/近3章）向 AI 提问，缺上下文会说「需补充」不编造
+- ⏩ **连写 N 章**：前端循环跑流水线（快速模式），逐章刷新状态栏，随时可停，429/限流自动止损
+- 📈 **创作看板**：`GET /api/books/:id/stats`——总字数/章数/未回收伏笔/角色数/连续写作天数/近14天写章柱状图
+- **伏笔可视化**：伏笔 tab 未回收角标 + 紧急伏笔强制进任务书（prompt 注入）
+
 ## LLM 对接
 - **OpenAI 兼容格式**：任意端点（OpenRouter / Groq / DeepSeek / Moonshot / Ollama / vLLM…），填 Base URL + Key + 模型
 - **Cloudflare Workers AI**：`@cf/meta/llama-3.1-8b-instruct` 等，免费额度 0 成本
