@@ -1321,6 +1321,17 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 .steps .st.fail::before{content:'✗';margin-right:4px}
 /* 操作结果状态条（流水线面板内） */
 .resbar{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+/* 次要操作（虚线幽灵按钮，视觉降一级） */
+button.ghost{background:transparent;border-style:dashed;color:var(--mut)}
+button:hover{border-color:var(--acc);filter:brightness(1.05)}
+button:active{transform:translateY(1px)}
+/* 标签栏吸顶：长列表里随时切 tab */
+.tabwrap{position:sticky;top:0;z-index:6;background:var(--bg);padding:6px 0;margin:-6px 0 10px}
+/* 长文排版：正文编辑与预览用衬线（小说阅读感） */
+pre.novel,textarea.novel{font:15px/2 "Noto Serif SC","Songti SC",Georgia,serif;letter-spacing:.02em}
+textarea.ednovel{resize:vertical;min-height:200px;font-size:15px;line-height:1.9}
+/* 状态栏左侧色条：busy 蓝 / 成功绿 / 失败红 */
+#statusBar{border-left:3px solid var(--acc)}
 @media(max-width:1100px){#app{grid-template-columns:260px 1fr}}
 @media(max-width:820px){#app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr}aside{border-right:none;border-bottom:1px solid var(--line);max-height:280px}#mobileBooks{display:block}}
 @media(max-width:520px){main{padding:10px}header .mut{display:none}}
@@ -1374,8 +1385,8 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 let TK=localStorage.getItem('nvs_token')||'', EMAIL=localStorage.getItem('nvs_email')||'', ADMIN=null, BK=null, TAB='chapters';
 const $=s=>document.querySelector(s);
 // 状态栏：页底常驻反馈条（最近一次操作结果，成功绿/失败红）
-function toast(m,t){const sb=$('#statusBar');sb.innerHTML=(t==='bad'?'<span class="sbBad">✗ </span>':'<span class="sbOk">✓ </span>')+m+'<button id="sbClose" style="float:right;margin-left:10px;border:none;background:none;cursor:pointer">× 收起</button>';sb.style.display='block';const c=$('#sbClose');if(c)c.onclick=()=>{sb.style.display='none'};clearTimeout(toast._t);toast._t=setTimeout(()=>{sb.style.display='none'},t==='bad'?8000:4000)}
-function status(msg,kind){const sb=$('#statusBar');if(kind==='hide'){sb.style.display='none';return}sb.style.display='block';sb.innerHTML=kind==='busy'?'<span>⏳ '+msg+'</span>':(kind==='bad'?'<span class="sbBad">✗ '+msg+'</span>':'<span class="sbOk">✓ '+msg+'</span>');clearTimeout(status._t);if(kind!=='busy')status._t=setTimeout(()=>{sb.style.display='none'},6000)}
+function toast(m,t){const sb=$('#statusBar');sb.innerHTML=(t==='bad'?'<span class="sbBad">✗ </span>':'<span class="sbOk">✓ </span>')+m+'<button id="sbClose" style="float:right;margin-left:10px;border:none;background:none;cursor:pointer">× 收起</button>';sb.style.display='block';sb.style.borderLeftColor=t==='bad'?'var(--bad)':'var(--ok)';const c=$('#sbClose');if(c)c.onclick=()=>{sb.style.display='none'};clearTimeout(toast._t);toast._t=setTimeout(()=>{sb.style.display='none'},t==='bad'?8000:4000)}
+function status(msg,kind){const sb=$('#statusBar');if(kind==='hide'){sb.style.display='none';return}sb.style.display='block';sb.style.borderLeftColor=kind==='busy'?'var(--acc)':(kind==='bad'?'var(--bad)':'var(--ok)');sb.innerHTML=kind==='busy'?'<span>⏳ '+msg+'</span>':(kind==='bad'?'<span class="sbBad">✗ '+msg+'</span>':'<span class="sbOk">✓ '+msg+'</span>');clearTimeout(status._t);if(kind!=='busy')status._t=setTimeout(()=>{sb.style.display='none'},6000)}
 async function api(path,opt={}){
   const r=await fetch(path,{method:opt.method||'GET',headers:{'Content-Type':'application/json',...(TK?{Authorization:'Bearer '+TK}:{})},body:opt.body?JSON.stringify(opt.body):undefined});
   let b;try{b=await r.json()}catch{b={}}
@@ -1455,14 +1466,15 @@ async function openBook(id,title){
       写作链路：<b>1</b> 建设定（世界观/角色/伏笔）→ <b>2</b> 出大纲 → <b>3</b> 一键写下一章 → <b>4</b> 看章节结果 → <b>5</b> 导出成书。
       第一次建议顺序做；设定越全，后写的章越不跑偏。
     </div>
-    <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vPipeN">⏩ 连写N章</button><input id="vPipeNN" type="number" min="1" max="50" value="3" title="连写章数" style="width:60px"><button id="vChat">💬 问设定</button><button id="vOutline">生成大纲</button><button id="vExpand">扩设定</button><button id="vAnti">AI味清单</button><button id="vExport">导出小说</button></div>
+    <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vPipeN">⏩ 连写N章</button><input id="vPipeNN" type="number" min="1" max="50" value="3" title="连写章数" style="width:56px"><button id="vChat">💬 问设定</button></div>
+    <div class="row"><button class="ghost" id="vOutline">生成大纲</button><button class="ghost" id="vExpand">扩设定</button><button class="ghost" id="vAnti">AI味清单</button><button class="ghost" id="vExport">导出小说</button></div>
     <div class="small muted">模式区别：标准=全套 6 步（最稳）· 快速=省掉部分审查（更快）· 极简=只起草+存档（最便宜，先试水用）。写完可导出 TXT/MD/HTML/EPUB。连写=一次跑 N 章（每章独立过 6 步，可随时停）；问设定=带着全书设定/账本向 AI 提问。</div>
     \${d.book.world_setting?\`<details><summary><b>世界观设定</b></summary><pre>\${d.book.world_setting}</pre></details>\`:\`<details class="muted"><summary>还没有世界观设定：点「扩设定」让 AI 帮你补，或在「伏笔/角色」标签里先把人立住</summary></details>\`}
     \${d.book.characters?\`<details><summary><b>角色设定</b></summary><pre>\${d.book.characters}</pre></details>\`:''}
   </div>
-  <div class="tabbar">
+  <div class="tabwrap"><div class="tabbar">
     \${['chapters:章节','roles:角色','loops:伏笔','outline:大纲','events:事件流','ledger:事实账本','sums:卷摘要','stats:📈看板'].map(t=>{const k=t.split(':');const openN=k[0]==='loops'?d.loops.filter(x=>x.status==='open').length:0;return '<button data-tab="'+k[0]+'" class="tb '+(k[0]===TAB?'on':'')+'">'+k[1]+(k[0]==='loops'&&openN?' <span class="badge warn">'+openN+'未收</span>':'')+'</button>'}).join('')}
-  </div>
+  </div></div>
   <div id="tabBody"></div>
   <div id="pipePanel" style="display:none"></div><div id="exportPanel"></div>\`;
   main.querySelectorAll('.tb').forEach(b=>b.onclick=()=>{TAB=b.dataset.tab;main.querySelectorAll('.tb').forEach(x=>x.classList.toggle('on',x===b));renderTab()});
@@ -1485,28 +1497,56 @@ async function tabChapters(){
     <td><span class="badge \${c.status==='committed'?'ok':c.status==='rejected'?'bad':'warn'}">\${c.status||'draft'}</span></td>
     <td class="small muted">\${(c.summary||'').slice(0,50)}\${c.hook?'<br>钩：'+(c.hook||'').slice(0,40):''}</td>
     <td><button class="ev" data-id="\${c.id}">读</button> <button class="ed" data-id="\${c.id}">编</button> <button class="del" data-id="\${c.id}">删</button></td></tr>\`).join('')+'</table>':'<div class="muted">尚无章节。点「⚡ 一键写下一章」启动 6 步流水线。</div>';
-  list.querySelectorAll('.ev').forEach(b=>b.onclick=async()=>{const r=await api('/api/chapters/'+b.dataset.id);toast(\`<b>第\${r.seq}章 \${r.title}</b><br><pre>\${r.content||'(空)'}</pre>\${r.review_json?'<b>审查</b><pre>'+JSON.stringify(JSON.parse(r.review_json),null,1).slice(0,600)+'</pre>':''}\`)});
+  list.querySelectorAll('.ev').forEach(b=>b.onclick=async()=>{const r=await api('/api/chapters/'+b.dataset.id);
+    const w=document.createElement('div');w.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center;padding:16px;overflow:auto';
+    w.innerHTML='<div class="card" style="max-width:880px;width:94%;max-height:88vh;overflow:auto"><div class="row" style="justify-content:space-between"><b>📖 第'+r.seq+'章 '+escH(r.title||'')+'</b><span class="badge">'+String(r.content||'').length+' 字</span></div>'
+      +'<pre class="novel" style="white-space:pre-wrap;margin:10px 0">'+escH(r.content||'(空章，点「编」填写正文后跑流水线)')+'</pre>'
+      +(r.review_json?'<details><summary>审查记录</summary><pre style="max-height:200px;overflow:auto">'+escH(JSON.stringify(JSON.parse(r.review_json),null,1).slice(0,800))+'</pre></details>':'')
+      +'<div class="row"><button class="ghost" id="pClose">关闭</button></div></div>';
+    document.body.appendChild(w);
+    const close=()=>w.remove();
+    w.querySelector('#pClose').onclick=close;
+    w.addEventListener('click',e=>{if(e.target===w)close()});
+    window.addEventListener('keydown',function onk(e){if(e.key==='Escape'){close();window.removeEventListener('keydown',onk)}});
+  });
   list.querySelectorAll('.del').forEach(b=>b.onclick=async()=>{if(!confirm('删除此章？'))return;await api('/api/chapters/'+b.dataset.id,{method:'DELETE'});tabChapters()});
   list.querySelectorAll('.ed').forEach(b=>b.onclick=async()=>{try{await editCh(b.dataset.id)}catch(e){toast(e.message,'bad')}});
   $('#chNewBtn').onclick=async()=>{try{const t=$('#chNew').value;const r=await api(\`/api/books/\${BK}/chapters\`,{method:'POST',body:{title:t}});toast('已创建空白章 #'+r.id+'（点「编」填写正文后跑流水线）');tabChapters()}catch(e){toast(e.message,'bad')}};
 }
 
 const escH=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+// 属性值转义：多转引号（放 input value / data-* 用，防破属性）
+const escAttr=s=>escH(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 async function editCh(id){
   const r=await api('/api/chapters/'+id);
-  const el=document.createElement('div');el.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center';
-  el.innerHTML='<div class="card" style="max-width:640px;width:94%">'
-    +'<b>编辑第'+r.seq+'章</b>'
-    +'<label>标题</label><input id="eTitle" value="'+escH(r.title)+'">'
-    +'<label>正文（留空=保持原样）</label><textarea id="eContent" rows="8">'+escH(r.content)+'</textarea>'
-    +'<label>摘要（留空=不改）</label><input id="eSummary" value="'+escH(r.summary)+'">'
-    +'<label>钩子（留空=不改）</label><input id="eHook" value="'+escH(r.hook)+'">'
+  const el=document.createElement('div');el.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center;overflow:auto;padding:16px';
+  el.innerHTML='<div class="card" style="max-width:880px;width:96%;max-height:92vh;overflow:auto">'
+    +'<div class="row" style="justify-content:space-between"><b>✏️ 编辑第'+r.seq+'章</b><span class="badge" id="eWcnt"></span></div>'
+    +'<label>标题</label><input id="eTitle" value="'+escAttr(r.title)+'">'
+    +'<label>正文（留空=保持原样）</label><textarea id="eContent" class="ednovel" rows="14">'+escAttr(r.content)+'</textarea>'
+    +'<label>摘要（留空=不改）</label><input id="eSummary" value="'+escAttr(r.summary)+'">'
+    +'<label>钩子（留空=不改）</label><input id="eHook" value="'+escAttr(r.hook)+'">'
     +'<label>状态</label><select id="eStatus"><option value="">保持（'+(r.status||'draft')+'）</option><option value="draft">draft</option><option value="committed">committed</option><option value="rejected">rejected</option></select>'
-    +'<div class="row"><button class="primary" id="eSave">保存</button><button id="eCancel">取消</button></div>'
+    +'<div class="row"><button class="primary" id="eSave">保存</button><button class="ghost" id="eCancel">取消</button><span class="muted small">Ctrl+S 保存 · Esc 关闭 · 正文约 2000 字/章</span></div>'
     +'</div>';
   document.body.appendChild(el);
-  $('#eCancel').onclick=()=>el.remove();
-  $('#eSave').onclick=async()=>{const body={};if($('#eTitle').value.trim()&&$('#eTitle').value!==r.title)body.title=$('#eTitle').value;if($('#eContent').value!==String(r.content||''))body.content=$('#eContent').value;if($('#eSummary').value)body.summary=$('#eSummary').value;if($('#eHook').value)body.hook=$('#eHook').value;if($('#eStatus').value)body.status=$('#eStatus').value;try{await api('/api/chapters/'+id,{method:'PATCH',body});el.remove();toast('已保存第'+r.seq+'章');if(TAB==='chapters')tabChapters()}catch(e){toast(e.message,'bad')}};
+  const tc=()=>{const n=$('#eContent').value.length;$('#eWcnt').textContent=n?n+' 字':(String(r.content||'').length+' 字（未改）');$('#eWcnt').classList.toggle('warn',n&&n<800)};
+  $('#eContent').addEventListener('input',tc);tc();
+  const close=()=>{el.remove();window.removeEventListener('keydown',onkey)};
+  const onkey=e=>{if(e.key==='Escape')close();if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();$('#eSave').click()}};
+  window.addEventListener('keydown',onkey);
+  $('#eCancel').onclick=close;
+  $('#eSave').onclick=async()=>{
+    const nt=$('#eTitle').value,nc=$('#eContent').value,ns=$('#eSummary').value,nh=$('#eHook').value,ns2=$('#eStatus').value;
+    const body={};
+    if(nt.trim()&&nt!==String(r.title||''))body.title=nt;
+    if(nc!==String(r.content||''))body.content=nc;
+    if(ns)body.summary=ns;
+    if(nh)body.hook=nh;
+    if(ns2)body.status=ns2;
+    if(!Object.keys(body).length){toast('没有改动');return}
+    try{await api('/api/chapters/'+id,{method:'PATCH',body});close();toast('已保存第'+r.seq+'章');if(TAB==='chapters')tabChapters()}catch(e){toast(e.message,'bad')}
+  };
 }
 
 async function tabRoles(){
@@ -1665,7 +1705,7 @@ async function runPipe(mode){
     done=true;curStep=steps.length;paint();
     status('','hide');
     const rc=r.review||{};
-    p.innerHTML=\`<div class="card"><b>✅ 第\${r.seq}章「\${r.title}」写完</b>
+    p.innerHTML=\`<div class="card"><b>✅ 第\${r.seq}章「\${escH(r.title||'')}」写完</b>
       <div class="resbar">
         <span class="badge \${r.status==='committed'?'ok':'bad'}">\${r.status==='committed'?'已存进章节列表':'有硬伤，标为待处理'}</span>
         <span class="badge">用时 \${(r.ms/1000).toFixed(0)} 秒</span>
@@ -1676,9 +1716,9 @@ async function runPipe(mode){
         \${r.hasPlaceholder?'<span class="badge bad">检测到占位符，已降级</span>':''}
       </div>
       <div class="row">\${['standard','fast','minimal'].map(m=>\`<button data-rerun="\${m}">⚡ 再写下一章（\${{standard:'标准',fast:'快速',minimal:'极简'}[m]}）</button>\`).join('')}</div>
-      <details><summary>正文</summary><pre>\${r.content}</pre></details>
-      \${rc.issues?.length?\`<details><summary>审查（\${rc.issues_count} 项）</summary><pre>\${JSON.stringify(rc,null,1).slice(0,800)}</pre></details>\`:''}
-      <details><summary>摘要 / 钩子</summary><pre>\${r.summary||'(空)'}\${r.hook?'\\\\n钩：'+r.hook:''}</pre></details>
+      <details><summary>正文</summary><pre class="novel">\${escH(r.content||'(空)')}</pre></details>
+      \${rc.issues?.length?\`<details><summary>审查（\${rc.issues_count} 项）</summary><pre>\${escH(JSON.stringify(rc,null,1).slice(0,800))}</pre></details>\`:''}
+      <details><summary>摘要 / 钩子</summary><pre>\${escH(r.summary||'(空)')}\${r.hook?'\\n钩：'+escH(r.hook):''}</pre></details>
       <div class="muted small">去「章节」标签看结果；「事实账本」「角色」标签里能看到刚回写的内容。</div>
     </div>\`;
     p.querySelectorAll('[data-rerun]').forEach(b=>b.onclick=()=>runPipe(b.dataset.rerun));
@@ -1688,7 +1728,7 @@ async function runPipe(mode){
     fail=true;paint();
     status('','hide');
     toast('写章失败：'+e.message,'bad');
-    p.innerHTML=\`<div class="card"><b>✗ 写章失败</b><div>\${e.message}</div>
+    p.innerHTML=\`<div class="card"><b>✗ 写章失败</b><div>\${escH(e.message)}</div>
       <div class="muted small">常见原因：模型没配置 / Key 失效。点顶部「🧠 模型」检查并测试连通。</div></div>\`;
   }
 }
@@ -1700,24 +1740,26 @@ async function runPipeN(){
   _stopPipe=false;
   const p=$('#pipePanel');p.style.display='';
   p.innerHTML='<div class="card"><b>⏩ 连写 '+n+' 章（快速模式）</b>'
-    +'<div class="muted small">每章独立跑 6 步（快速），状态栏逐章刷新。共约 '+(n*2)+'-'+(n*4)+' 分钟。</div>'
-    +'<div id="pnList" class="muted small">开始…</div>'
-    +'<div class="row" style="margin-top:8px"><button id="pnStop">■ 停止连写</button></div></div>';
+    +'<div class="muted small">每章独立跑 6 步（快速），状态栏逐章刷新。预计共 '+(n*2)+'-'+(n*4)+' 分钟。</div>'
+    +'<div id="pnList" class="muted small" style="max-height:220px;overflow:auto;padding:6px 0"><div>开始…</div></div>'
+    +'<div class="row" style="margin-top:8px"><button id="pnStop">■ 停止连写</button><button class="ghost" id="pnHide">收起来</button></div></div>';
   $('#pnStop').onclick=()=>{_stopPipe=true;$('#pnStop').textContent='正在停止…'};
+  $('#pnHide').onclick=()=>p.style.display='none';
   let ok=0,faild=0;
   for(let i=1;i<=n;i++){
     if(_stopPipe)break;
     status('连写中：第 '+i+'/'+n+' 章…','busy');
+    const li=document.createElement('div');li.innerHTML='⏳ 第 '+i+' 章…';$('#pnList').appendChild(li);$('#pnList').scrollTop=$('#pnList').scrollHeight;
     try{
       const r=await api('/api/books/'+BK+'/pipeline',{method:'POST',body:{mode:'fast',words:2000}});
       ok++;
-      $('#pnList').innerHTML+='<div>✅ 第'+r.seq+'章「'+(r.title||'')+'」'+(r.status==='committed'?'已存':'有硬伤')+'（'+(r.ms/1000).toFixed(0)+'s）</div>';
+      li.innerHTML='✅ 第'+r.seq+'章「'+escH(r.title||'')+'」'+(r.status==='committed'?'已存':'<b style="color:var(--warn)">有硬伤</b>')+'（'+(r.ms/1000).toFixed(0)+'s）';
     }catch(e){
       faild++;
-      $('#pnList').innerHTML+='<div>✗ 第'+i+'章失败：'+escH(e.message)+'（后续已跳过，可单独补写）</div>';
-      if(e.codeRequired||/limit|429|timeout/i.test(e.message))break;
+      li.innerHTML='✗ 第'+i+'章失败：'+escH(e.message)+'<span class="muted">（后续可单独补写）</span>';
+      if(e.codeRequired||/limit|429|timeout/i.test(e.message)){li.innerHTML+=' <b style="color:var(--bad)">限流/超限，已止损</b>';break;}
     }
-    p.scrollTop=p.scrollHeight;
+    $('#pnList').scrollTop=$('#pnList').scrollHeight;
   }
   status('','hide');
   $('#pnStop').style.display='none';
@@ -1730,23 +1772,30 @@ async function openChatPane(){
   let pane=$('#chatPane');
   if(!pane){pane=document.createElement('div');pane.id='chatPane';document.body.appendChild(pane)}
   pane.style.cssText='display:grid;position:fixed;inset:0;z-index:56;place-items:center;background:rgba(0,0,0,.55)';
+  // 每次打开按当前书重建（历史问答属于上一本书，不能带脏数据）
   pane.innerHTML='<div class="card" style="max-width:620px;width:94%;max-height:80vh;overflow:auto">'
-    +'<b>💬 问设定</b> <span class="muted small">AI 基于本书的世界观/角色/伏笔/事实账本/近3章摘要回答；没问过的会说「需补充」不编造。</span>'
-    +'<div id="chatMsgs" class="small" style="margin:8px 0;max-height:40vh;overflow:auto"></div>'
+    +'<div class="row" style="align-items:center"><b>💬 问设定</b><span class="muted small">本书专属：AI 基于世界观/角色/伏笔/事实账本/近3章摘要回答；没覆盖的会说「需补充」不编造。</span></div>'
+    +'<div id="chatMsgs" class="small" style="margin:8px 0;max-height:38vh;overflow:auto"></div>'
     +'<div class="row"><input id="chatQ" placeholder="例：主角现在知道哪些情报？" style="flex:1"><button class="primary" id="chatGo">问</button></div>'
-    +'<div class="row"><button id="chatClose">关闭</button></div>'
+    +'<div class="row"><button class="ghost" id="chatClear">清空对话</button><button id="chatClose">关闭</button></div>'
     +'</div>';
+  const msgs=$('#chatMsgs');
+  msgs.innerHTML='<div class="muted small">还没有问过。直接问，比如「主角现在知道哪些情报？」「最近的伏笔哪条最紧急？」。</div>';
   $('#chatClose').onclick=()=>{pane.style.display='none'};
+  $('#chatClear').onclick=()=>{msgs.innerHTML=''};
   const q=$('#chatQ');
   const ask=async()=>{
     const question=q.value.trim();if(!question)return;
-    q.value='';const msgs=$('#chatMsgs');
-    msgs.innerHTML+='<div style="margin:6px 0"><b>Q：'+escH(question)+'</b><div id="chatLast" class="muted">…思考中</div></div>';
-    msgs.scrollTop=msgs.scrollHeight;
+    q.value='';
+    if(!msgs.firstElementChild||msgs.firstElementChild.classList.contains('muted'))msgs.innerHTML='';
+    const row=document.createElement('div');row.style.margin='8px 0';
+    row.innerHTML='<div style="font-weight:600;margin-bottom:4px">❓ '+escH(question)+'</div><div class="chatA muted" style="padding:8px;background:var(--panel2);border-radius:8px">…思考中</div>';
+    msgs.appendChild(row);msgs.scrollTop=msgs.scrollHeight;
+    const a=row.querySelector('.chatA');
     try{
       const r=await api('/api/books/'+BK+'/chat',{method:'POST',body:{question}});
-      const el=$('#chatLast');el.innerHTML=escH(r.answer||'(无回答)');el.classList.remove('muted');
-    }catch(e){const el=$('#chatLast');el.innerHTML='<span style="color:var(--bad)">✗ '+escH(e.message)+'</span>'}
+      a.innerHTML=escH(r.answer||'(无回答)');a.classList.remove('muted');
+    }catch(e){a.innerHTML='<span style="color:var(--bad)">✗ '+escH(e.message)+'</span>'}
     msgs.scrollTop=msgs.scrollHeight;
   };
   $('#chatGo').onclick=ask;

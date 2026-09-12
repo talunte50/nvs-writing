@@ -47,6 +47,7 @@ const must = [
   "vExport", "btnLogin", "btnReg", "btnTheme", "runPipe", "openAdmin",
   "admFetch", "statusBar", "btnModel", "openModelPane", "adminUsers", "adminLlm", "adminSite",
   "runPipeN", "openChatPane", "tabStats", "vPipeN", "vChat",
+  "escAttr", "ednovel", "tabwrap", "chatClear", "eWcnt", "pClose",
 ];
 for (const m of must) {
   if (!browserJs.includes(m)) throw new Error(`浏览器 JS 缺少关键符号：${m}`);
