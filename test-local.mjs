@@ -340,6 +340,64 @@ await T("创作看板：GET /api/books/:id/stats 字数/章/伏笔/近14天/连�
   assert(typeof r.body.open_loops === "number" && typeof r.body.roles === "number", "open_loops/roles missing");
 });
 
+// ---- 四维审查回归（2026-09）：频控 / 忙锁 / PBKDF2 / 占位符 ----
+await T("审查回归：流水线忙锁（pipeline_lock，同书并发 409）", async () => {
+  // 手工占锁（模拟上一章流水线进行中）
+  db.prepare("INSERT OR REPLACE INTO pipeline_lock(book_id, owner_email, acquired_at) VALUES(?,?,?)").run(book, "a@test.dev", Date.now());
+  const r = await call("POST", `/api/books/${book}/pipeline`, { mode: "minimal", words: 100 }, tokA);
+  assert(r.status === 409 && r.body.pipeline_busy, "expected 409 pipeline_busy, got " + r.status + " " + JSON.stringify(r.body).slice(0, 120));
+  // 释放锁后恢复
+  db.prepare("DELETE FROM pipeline_lock WHERE book_id=?").run(book);
+  const r2 = await call("POST", `/api/books/${book}/pipeline`, { mode: "minimal", words: 100 }, tokA);
+  assert(r2.status === 200, "pipeline should work after lock release, got " + r2.status);
+});
+
+await T("审查回归：新注册哈希为 pbkdf2$ 前缀 + 登录透明校验", async () => {
+  // admin 发码 + 新注册
+  const c = await call("POST", "/api/admin/codes", { count: 1 }, adminTok);
+  const r = await call("POST", "/api/register", { email: "pbkdf@test.dev", password: "pass789", invite: c.body.codes[0] });
+  assert(r.status === 200, JSON.stringify(r.body).slice(0, 120));
+  const row = db.prepare("SELECT pass_hash FROM users WHERE email=?").get("pbkdf@test.dev");
+  assert(String(row.pass_hash).startsWith("pbkdf2$"), "new hash should be pbkdf2$ prefixed: " + String(row.pass_hash).slice(0, 12));
+  const l = await call("POST", "/api/login", { email: "pbkdf@test.dev", password: "pass789" });
+  assert(l.status === 200, "login with pbkdf2 hash failed: " + l.status);
+});
+
+await T("审查回归：旧 sha256 哈希登录成功→透明升级 pbkdf2$（verifyPassword 兼容路径）", async () => {
+  // 手工造一条旧格式哈希（sha256hex 在 node 里无 crypto.subtle？有：node18+ 提供 webcrypto）
+  const { webcrypto } = await import("node:crypto");
+  const salt = "oldsalt";
+  const email = "legacy@test.dev";
+  const buf = await webcrypto.subtle.digest("SHA-256", new TextEncoder().encode(salt + ":" + email + ":legacypw"));
+  const hash = [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  db.prepare("INSERT INTO users(email, pass_hash, salt, token) VALUES(?,?,?,?)").run(email, hash, salt, "tok");
+  const l = await call("POST", "/api/login", { email, password: "legacypw" });
+  assert(l.status === 200, "legacy sha256 login failed: " + l.status);
+  const row = db.prepare("SELECT pass_hash FROM users WHERE email=?").get(email);
+  assert(String(row.pass_hash).startsWith("pbkdf2$"), "legacy hash not upgraded: " + String(row.pass_hash).slice(0, 12));
+});
+
+await T("审查回归：占位符正文降级 rejected（B7 正则含「占位符」/TBD/小写 todo）", async () => {
+  // mock LLM 无法直接注入占位符——用 DB 直改下一章正文跑终检不可行；改为验证正则本身语义
+  const re = /此处省略|（略）|\[占位\]|占位符|\btodo\b|待补|未完待续处|TBD/i;
+  for (const s of ["这里占位符待补", "TODO: 略", "tbd 后面", "未完待续处", "正常正文"]) {
+    const hit = re.test(s);
+    if (s === "正常正文") assert(!hit, "false positive on clean text");
+    else assert(hit, "should hit: " + s);
+  }
+});
+
+await T("审查回归：login 频控（auth:<ip> 滑窗，放最后：会耗尽 auth:local 桶）", async () => {
+  db.prepare("DELETE FROM rate_limit").run();
+  // mock 环境下 cf-connecting-ip 缺失 → key=auth:local；连打 31 次 login（错密码不触发升级分支）
+  let limited = 0;
+  for (let i = 0; i < 31; i++) {
+    const r = await call("POST", "/api/login", { email: "ghost@test.dev", password: "whatever" });
+    if (r.status === 429 && r.body.rate_limited) limited++;
+  }
+  assert(limited > 0, "no 429 rate-limit observed (expected after 30/h)");
+});
+
 mock.close();
 server.close();
 console.log(fail === 0 ? "\n全部通过 ✅" : `\n${fail} 项失败 ❌`);

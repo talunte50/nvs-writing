@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS chapters (
   updated_at TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_chapters_book ON chapters(book_id);
+-- B3：同一本书内 seq 必须唯一（防并发双写同 seq 章）。
+-- 幂等迁移：先给存量数据去重（每 (book_id,seq) 保留最小 id），再建唯一索引（已去重则 0 行）
+DELETE FROM chapters WHERE id NOT IN (SELECT MIN(id) FROM chapters GROUP BY book_id, seq);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_chapters_book_seq ON chapters(book_id, seq);
 
 -- 角色设定（对应 webnovel-writer 设定集/角色索引）
 CREATE TABLE IF NOT EXISTS roles (
@@ -174,4 +178,19 @@ CREATE TABLE IF NOT EXISTS ai_usage (
   action TEXT DEFAULT '',
   ok INTEGER DEFAULT 1,
   ts TEXT DEFAULT (datetime('now'))
+);
+
+-- B1：D1 滑窗频控（key=nsv:auth:<ip> / nsv:pipe:<email> / nsv:chat:<email>；n=窗口内计数，ts=窗口起点，1h 重置）
+CREATE TABLE IF NOT EXISTS rate_limit (
+  key TEXT PRIMARY KEY,
+  n INTEGER NOT NULL DEFAULT 1,
+  ts INTEGER NOT NULL
+);
+-- C3：ai_usage 只保留 90 天（本地/CI 定期跑：DELETE FROM ai_usage WHERE ts < datetime('now','-90 day')）
+
+-- B3：写章忙锁（一本书同时只允许一个流水线，防并发双写；TTL 兜底防死锁）
+CREATE TABLE IF NOT EXISTS pipeline_lock (
+  book_id INTEGER PRIMARY KEY,
+  owner_email TEXT NOT NULL DEFAULT '',
+  acquired_at INTEGER NOT NULL
 );

@@ -13,15 +13,67 @@ const LLM_DEFAULTS = {
 };
 
 // ---------- helpers ----------
+// D4：单域站点（HTML 与 API 同一 Worker），API 不再向任意跨域开放（防第三方页面读取受认证响应）
 function json(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "***", ...extraHeaders },
+    headers: { "Content-Type": "application/json; charset=utf-8", ...extraHeaders },
   });
 }
 async function sha256hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+// PBKDF2 密码哈希（10万轮 SHA-256）：新注册/改密走 "pbkdf2$" 前缀；旧单次 SHA-256 哈希登录成功时透明升级
+async function pbkdf2Hex(password, salt, email) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(String(password)), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt + ":" + email), iterations: 100000 },
+    key, 256
+  );
+  return [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+// 按前缀区分并校验密码哈希（users.pass_hash / admin_auth.hash），返回 "pbkdf2" | "sha256" | false
+async function verifyPassword(row, email, password) {
+  const hash = String(row.pass_hash ?? row.hash ?? "");
+  const pw = String(password ?? "");
+  if (hash.startsWith("pbkdf2$")) {
+    const p = await pbkdf2Hex(pw, row.salt, email);
+    return p === hash.slice(7) ? "pbkdf2" : false;
+  }
+  const s = await sha256hex(row.salt + ":" + email + ":" + pw);
+  return s === hash ? "sha256" : false;
+}
+// 写章忙锁（pipeline_lock 表，B3）：一本书同时只允许一个流水线；30 分钟 TTL 兜底（进程中途挂掉不留死锁）
+async function pipelineLockOk(env, bookId, email) {
+  try {
+    const now = Date.now();
+    const row = await env.DB.prepare("SELECT owner_email, acquired_at FROM pipeline_lock WHERE book_id=?").bind(bookId).first();
+    if (row && row.owner_email === email && now - Number(row.acquired_at) < 30 * 60 * 1000) return false;
+    await env.DB.prepare("INSERT INTO pipeline_lock(book_id, owner_email, acquired_at) VALUES(?,?,?) ON CONFLICT(book_id) DO UPDATE SET owner_email=excluded.owner_email, acquired_at=excluded.acquired_at").bind(bookId, email, now).run();
+    return true;
+  } catch {
+    return true; // 表未迁移时 fail-open（与频控一致）
+  }
+}
+async function pipelineLockFree(env, bookId) {
+  try { await env.DB.prepare("DELETE FROM pipeline_lock WHERE book_id=?").bind(bookId).run(); } catch {}
+}
+// 滑窗频控（rate_limit 表，B1）：每请求一次。表缺失/迁移失败时 fail-open，不阻断业务
+async function rateLimitOk(env, key, max, windowMs = 3600000) {
+  try {
+    const now = Date.now();
+    const row = await env.DB.prepare("SELECT n, ts FROM rate_limit WHERE key=?").bind(key).first();
+    if (!row || now - Number(row.ts) >= windowMs) {
+      await env.DB.prepare("INSERT INTO rate_limit(key,n,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET n=1, ts=?").bind(key, 1, now, now).run();
+      return true;
+    }
+    if (row.n >= max) return false;
+    await env.DB.prepare("UPDATE rate_limit SET n=n+1 WHERE key=?").bind(key).run();
+    return true;
+  } catch {
+    return true;
+  }
 }
 async function genToken() {
   const buf = await crypto.getRandomValues(new Uint8Array(20));
@@ -60,11 +112,6 @@ async function authAdmin(env, req) {
   const row = await env.DB.prepare("SELECT admin_email FROM admin_tokens WHERE token=?").bind(m[1].trim()).first();
   return row ? row.admin_email : null;
 }
-function isAdmin(email) {
-  // 管理员邮箱同时也是普通用户？不：管理员接口仅认 admin token
-  return !!email;
-}
-
 async function getLlm(env, email) {
   const row = await env.DB.prepare("SELECT provider, base_url, model, api_key FROM llm_settings WHERE user_email=?").bind(email).first();
   const s = { ...LLM_DEFAULTS, api_key: "" };
@@ -147,20 +194,24 @@ async function buildTaskSheet(env, s, book, target, mode, statePack, antiAiRules
     (mode === "fast"
       ? "请输出三段任务书：①本章目标与禁区 ②出场人物状态与动机 ③节奏与结尾钩子方向。只输出任务书文本。"
       : "请输出五段写作任务书：①开篇委托（章号/标题/一句话目标）②这章的故事（前文承接、本章目标与阻力、必须覆盖与禁区、紧急伏笔处理）③这章的人物（每人：状态、驱动力、本章作用、说话倾向）④怎么写更顺（节奏、情绪走向、避免 AI 味）⑤收在哪里（结尾停在什么感觉、留什么未完感）。只输出任务书，自然语气，不要出现系统术语。");
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 4000, temperature: 0.4 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 4000, temperature: LLM_TUNING.task });
   return { taskSheet: out, item, urgent };
 }
 // ---------- 状态包组装（写章前的一致性地基：前情/卷摘/角色声纹与状态/未回收伏笔/账本事实/章纲/负面清单） ----------
 // 账本（ledger）是跨章事实真源：rule/knowledge/lineage 全量注入，state 取最近 30 条；
 // 章节多时（>3）前情用卷级摘要（summaries）而非全量，控制上下文成本。
 async function buildStatePack(env, book, target, antiAiRules) {
-  const roles = (await env.DB.prepare("SELECT name, role_type, profile, voice, is_protagonist, state_note FROM roles WHERE book_id=? ORDER BY is_protagonist DESC, id").bind(book.id).all()).results || [];
-  const loops = (await env.DB.prepare("SELECT content, urgency, planted_chapter FROM foreshadows WHERE book_id=? AND status='open' ORDER BY urgency DESC LIMIT 10").bind(book.id).all()).results || [];
-  const ledger = (await env.DB.prepare("SELECT fact_type, subject, fact FROM ledger WHERE book_id=? AND status='active' AND fact_type IN ('rule','knowledge','lineage')").bind(book.id).all()).results || [];
-  const ledgerState = (await env.DB.prepare("SELECT fact_type, subject, fact, chapter_seq FROM ledger WHERE book_id=? AND status='active' AND fact_type='state' ORDER BY chapter_seq DESC, id DESC LIMIT 30").bind(book.id).all()).results || [];
-  const vols = (await env.DB.prepare("SELECT text FROM summaries WHERE book_id=? ORDER BY seq_to DESC LIMIT 2").bind(book.id).all()).results || [];
-  const maxRow = await env.DB.prepare("SELECT MAX(seq) AS m FROM chapters WHERE book_id=?").bind(book.id).first();
-  const prevCh = (await env.DB.prepare("SELECT seq, title, summary, hook FROM chapters WHERE book_id=? AND seq < ? AND summary != '' ORDER BY seq DESC LIMIT 3").bind(book.id, target.seq).all()).results || [];
+  // C1：7 个独立查询并行（Promise.all），D1 往返不再串行叠加
+  const allQ = (q) => q.all().then((r) => r.results || []);
+  const [roles, loops, ledger, ledgerState, vols, prevCh, maxRow] = await Promise.all([
+    allQ(env.DB.prepare("SELECT name, role_type, profile, voice, is_protagonist, state_note FROM roles WHERE book_id=? ORDER BY is_protagonist DESC, id").bind(book.id)),
+    allQ(env.DB.prepare("SELECT content, urgency, planted_chapter FROM foreshadows WHERE book_id=? AND status='open' ORDER BY urgency DESC LIMIT 10").bind(book.id)),
+    allQ(env.DB.prepare("SELECT fact_type, subject, fact FROM ledger WHERE book_id=? AND status='active' AND fact_type IN ('rule','knowledge','lineage')").bind(book.id)),
+    allQ(env.DB.prepare("SELECT fact_type, subject, fact, chapter_seq FROM ledger WHERE book_id=? AND status='active' AND fact_type='state' ORDER BY chapter_seq DESC, id DESC LIMIT 30").bind(book.id)),
+    allQ(env.DB.prepare("SELECT text FROM summaries WHERE book_id=? ORDER BY seq_to DESC LIMIT 2").bind(book.id)),
+    allQ(env.DB.prepare("SELECT seq, title, summary, hook FROM chapters WHERE book_id=? AND seq < ? AND summary != '' ORDER BY seq DESC LIMIT 3").bind(book.id, target.seq)),
+    env.DB.prepare("SELECT MAX(seq) AS m FROM chapters WHERE book_id=?").bind(book.id).first(),
+  ]);
   const prevs = [...prevCh].reverse();
 
   const parts = [];
@@ -179,6 +230,8 @@ async function buildStatePack(env, book, target, antiAiRules) {
 // reasoning 模型（如 agnes）思考过程与正文共享 max_tokens 预算：预算不足会 finish_reason=length 且正文为空。
 // 统一放大预算；起草类结果若为空再升预算重试一次。
 function draftBudget(words) { return Math.min(12000, Math.max(4000, (Number(words) || 2000) * 4)); }
+// C4：LLM 温度调参集中在此（各步骤引用 LLM_TUNING，不再散落魔法数字）
+const LLM_TUNING = { task: 0.4, draft: 0.9, draftRetry: 0.85, verify: 0.1, regen: 0.7, review: 0.1, fix: 0.4, polish: 0.4, extraction: 0.1, summarize: 0.3, chat: 0.3, outline: 0.9, expand: 0.8 };
 
 // ---------- 校验闭环（verify：初稿抽事实 → 对账本/设定 → 冲突则带反馈重生成一次，rejection sampling） ----------
 // 只报可验证矛盾（死而复生/左右手反了/提前知晓/能力越界），不评价文笔；standard+fast 跑，minimal 跳过。
@@ -190,7 +243,7 @@ async function buildVerify(env, s, book, target, draft, statePack, antiAiRules) 
   const user =
     `${statePack.pack}\n\n【故事梗概】${book.logline}\n【世界观】${book.world_setting || "（无）"}\n` +
     `【本章初稿 第${target.seq}章】\n${draft}\n\n请校验并只输出 JSON。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: 0.1 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: LLM_TUNING.verify });
   const parsed = extractJson(out) || null;
   const conflicts = (parsed?.conflicts || []).filter((c) => c && c.draft_evidence && c.severity === "hard");
   return { raw: out, parsed, conflicts };
@@ -203,7 +256,7 @@ async function regenerateDraft(env, s, book, target, draft, taskSheet, statePack
     `【写作任务书】\n${taskSheet}\n\n【状态包】\n${statePack.pack}\n\n` +
     (antiAiRules ? `【文风负面清单】\n${antiAiRules}\n\n` : "") +
     `【初稿 第${target.seq}章】\n${draft}\n\n【校验冲突（逐条消除）】\n${conflicts.map((c, n) => `${n + 1}. ${c.draft_evidence} ← 与「${c.source}」矛盾（${c.explanation}；方向：${c.fix_hint}）`).join("\n")}\n\n请定点修复后输出完整正文。`;
-  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.7 });
+  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: LLM_TUNING.regen });
 }
 
 // ---------- 流水线：起草（writer：任务书 + 状态包 + 负面清单，纯正文，无占位符） ----------
@@ -215,10 +268,10 @@ async function buildDraft(env, s, book, target, taskSheet, statePack, antiAiRule
     `【状态包（写章前必须自洽）】\n${statePack.pack}\n\n` +
     (antiAiRules ? `【文风负面清单（逐条遵守）】\n${antiAiRules}\n\n` : "") +
     `【本章】第${target.seq}章 ${target.title || "（按任务书标题）"}\n请起草本章正文，约${target.words}字。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.9 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: LLM_TUNING.draft });
   if (out && out.trim()) return out;
   // reasoning 模型思考吃满预算 → 正文为空：升预算重试一次
-  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(16000, draftBudget(target.words) * 1.5), temperature: 0.85 });
+  return await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: Math.min(16000, draftBudget(target.words) * 1.5), temperature: LLM_TUNING.draftRetry });
 }
 
 // ---------- 流水线：五维审查（reviewer：严格 JSON，5 维度逐一结论） ----------
@@ -230,7 +283,7 @@ async function buildReview(env, s, book, target, draft, taskSheet) {
     "\"issues_count\":0,\"blocking_count\":0,\"has_blocking\":false,\"dimension_results\":[{\"dimension\":\"setting\",\"conclusion\":\"pass\"},...必须覆盖全部5维度，无问题写pass],\"summary\":\"N个问题：X个阻断，Y个高优\"}。blocking 仅用于 critical 或确认阻断项。";
   const user =
     `【设定基准】${book.world_setting || "（无）"}\n【任务书（含禁区与紧急伏笔）】${taskSheet}\n\n【本章正文 第${target.seq}章】\n${draft}\n\n请审查并只输出 JSON。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 3000, temperature: 0.1 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 3000, temperature: LLM_TUNING.review });
   let parsed = extractJson(out) || null;
   if (parsed && !Array.isArray(parsed.dimension_results)) parsed.dimension_results = [];
   return { raw: out, parsed };
@@ -243,7 +296,7 @@ async function fixBlocking(env, s, book, target, draft, review) {
   const system = "你是网文编辑。针对审查列出的阻断问题做定点修复：只修改对应句段，不改剧情走向、不违反设定。输出修复后的完整正文，只输出正文。";
   const user =
     `【本章正文 第${target.seq}章】\n${draft}\n\n【阻断问题清单】\n${blocking.map((i, n) => `${n + 1}. [${i.category}] ${i.location}：${i.description}（证据：${i.evidence}；方向：${i.fix_hint}）`).join("\n")}\n\n请定点修复后输出完整正文。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.4 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: LLM_TUNING.fix });
   return { content: out, fixed: blocking.length };
 }
 
@@ -258,7 +311,7 @@ async function buildPolish(env, s, book, target, content, review, mode, antiAiRu
     `【非阻断问题】${nonBlocking.length ? nonBlocking.map((i) => `- [${i.category}] ${i.description}（${i.fix_hint}）`).join("\n") : "（无）"}\n\n` +
     (antiAiRules ? `【文风负面清单（Anti-AI 终检逐条对照）】\n${antiAiRules}\n\n` : "") +
     `请润色后输出完整正文。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: 0.4 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: draftBudget(target.words), temperature: LLM_TUNING.polish });
   return { content: out, skipped: false };
 }
 
@@ -275,7 +328,7 @@ async function buildExtraction(env, s, book, target, finalContent) {
     "纪律：正文里每埋一条新伏笔必须写一条 open_loop_created 事件；回收了既有伏笔必须写 open_loop_closed；拿不准的不写（宁缺毋滥）；不虚构正文未出现的事实。";
   const user =
     `【本书已知角色】${roles.map((r) => r.name).join("、") || "（未登记）"}\n【既有未回收伏笔】${openLoops.map((l) => `- ${l.content}（第${l.planted_chapter}章）`).join("\n") || "（无）"}\n\n【本章正文 第${target.seq}章】\n${finalContent}\n\n请提取事实，只输出 JSON。`;
-  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: 0.1 });
+  const out = await chat(env, s, [{ role: "system", content: system }, { role: "user", content: user }], { maxTokens: 2500, temperature: LLM_TUNING.extraction });
   return { raw: out, parsed: extractJson(out) };
 }
 
@@ -403,7 +456,7 @@ async function runPipeline(env, email, book, target) {
   let finalContent = polish.content;
   steps.step4_ms = Date.now() - t0;
   // 占位符终检（硬规则：禁止占位正文）—— 确定性检测，命中则降级状态
-  const hasPlaceholder = /此处省略|（略）|\[占位\]|TODO|待补|未完待续处/.test(finalContent);
+  const hasPlaceholder = /此处省略|（略）|\[占位\]|占位符|\btodo\b|待补|未完待续处|TBD/i.test(finalContent);
   // Step 5 事实提取（minimal 也提取摘要，保证回写链不断；含事实账本 facts）
   let extraction = null;
   try { extraction = await buildExtraction(env, s, book, target, finalContent); steps.step5_ms = Date.now() - t0; }
@@ -433,8 +486,6 @@ async function getSetting(env, key, def = "") {
 async function setSetting(env, key, value) {
   await env.DB.prepare("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=?").bind(key, value, value).run();
 }
-function requireInvite(env) { return true; } // settings.require_invite 在 register 内读
-
 const api = {
   // 公开：站点信息（SEO meta / 站点名 / 公告；无需登录，供前端启动时注入 head）
   "GET /api/site": async (env, req, p, admin) => {
@@ -449,6 +500,7 @@ const api = {
 
   // ---- 认证（注册需注册码，管理员可关闭 require_invite） ----
   "POST /api/register": async (env, req) => {
+    if (!(await rateLimitOk(env, "auth:" + (req.headers.get("cf-connecting-ip") || "local"), 30))) return json({ error: "尝试过于频繁，请 1 小时后再试", rate_limited: true }, 429);
     const b = await req.json().catch(() => ({}));
     const email = String(b.email || "").trim().toLowerCase();
     const password = String(b.password || "");
@@ -468,19 +520,24 @@ const api = {
       await env.DB.prepare("UPDATE invite_codes SET used_by=?, used_at=datetime('now') WHERE code=?").bind(email, code).run();
     }
     const salt = await genToken();
-    const hash = await sha256hex(salt + ":" + email + ":" + password);
+    const hash = "pbkdf2$" + await pbkdf2Hex(password, salt, email);
     const token = await genToken();
     await env.DB.prepare("INSERT INTO users(email, pass_hash, salt, token) VALUES(?,?,?,?)").bind(email, hash, salt, token).run();
     await env.DB.prepare("INSERT INTO llm_settings(user_email, provider, base_url, model, api_key) VALUES(?,?,?,?,?)").bind(email, LLM_DEFAULTS.provider, LLM_DEFAULTS.base_url, LLM_DEFAULTS.model, "").run();
     return json({ token, email });
   },
   "POST /api/login": async (env, req) => {
+    if (!(await rateLimitOk(env, "auth:" + (req.headers.get("cf-connecting-ip") || "local"), 30))) return json({ error: "尝试过于频繁，请 1 小时后再试", rate_limited: true }, 429);
     const b = await req.json().catch(() => ({}));
     const email = String(b.email || "").trim().toLowerCase();
     const row = await env.DB.prepare("SELECT * FROM users WHERE email=?").bind(email).first();
     if (!row) return json({ error: "账号不存在" }, 401);
-    const hash = await sha256hex(row.salt + ":" + email + ":" + String(b.password || ""));
-    if (hash !== row.pass_hash) return json({ error: "密码错误" }, 401);
+    const algo = await verifyPassword(row, email, b.password);
+    if (!algo) return json({ error: "密码错误" }, 401);
+    if (algo === "sha256") {
+      // 旧单次 SHA-256 哈希登录成功后透明升级为 PBKDF2（下次登录走新路径）
+      await env.DB.prepare("UPDATE users SET pass_hash=? WHERE email=?").bind("pbkdf2$" + await pbkdf2Hex(String(b.password), row.salt, email), email).run();
+    }
     if (row.blocked) return json({ error: "账号已被停用" }, 403);
     if (!row.token) {
       const t = await genToken();
@@ -500,7 +557,7 @@ const api = {
     const b = await req.json().catch(() => ({}));
     if (b.password && b.password.length >= 6) {
       const row = await env.DB.prepare("SELECT salt FROM users WHERE email=?").bind(email).first();
-      const hash = await sha256hex(row.salt + ":" + email + ":" + b.password);
+      const hash = "pbkdf2$" + await pbkdf2Hex(b.password, row.salt, email);
       await env.DB.prepare("UPDATE users SET pass_hash=? WHERE email=?").bind(hash, email).run();
     }
     let token;
@@ -515,6 +572,7 @@ const api = {
 
   // ---- 管理端：init 码创建首个管理员（admin_auth 空表时可用） ----
   "POST /api/admin/init": async (env, req) => {
+    if (!(await rateLimitOk(env, "auth-admin:" + (req.headers.get("cf-connecting-ip") || "local"), 10))) return json({ error: "尝试过于频繁，请 1 小时后再试", rate_limited: true }, 429);
     const b = await req.json().catch(() => ({}));
     const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM admin_auth").first();
     if (row && row.n > 0) return json({ error: "管理员已存在，不能重复初始化" }, 409);
@@ -522,19 +580,21 @@ const api = {
     const password = String(b.password || "");
     if (password.length < 8) return json({ error: "管理员密码至少 8 位" }, 400);
     const salt = await genToken();
-    const hash = await sha256hex(salt + ":" + email + ":" + password);
+    const hash = "pbkdf2$" + await pbkdf2Hex(password, salt, email);
     await env.DB.prepare("INSERT INTO admin_auth(email, salt, hash) VALUES(?,?,?)").bind(email, salt, hash).run();
     const token = await genToken();
     await env.DB.prepare("INSERT INTO admin_tokens(admin_email, token) VALUES(?,?)").bind(email, token).run();
     return json({ ok: true, admin_email: email, token });
   },
   "POST /api/admin/login": async (env, req) => {
+    if (!(await rateLimitOk(env, "auth-admin:" + (req.headers.get("cf-connecting-ip") || "local"), 10))) return json({ error: "尝试过于频繁，请 1 小时后再试", rate_limited: true }, 429);
     const b = await req.json().catch(() => ({}));
     const email = String(b.email || "").trim().toLowerCase();
     const row = await env.DB.prepare("SELECT * FROM admin_auth WHERE email=?").bind(email).first();
     if (!row) return json({ error: "管理员不存在" }, 401);
-    const hash = await sha256hex(row.salt + ":" + email + ":" + String(b.password || ""));
-    if (hash !== row.hash) return json({ error: "密码错误" }, 401);
+    const algo = await verifyPassword(row, email, b.password);
+    if (!algo) return json({ error: "密码错误" }, 401);
+    if (algo === "sha256") await env.DB.prepare("UPDATE admin_auth SET hash=? WHERE email=?").bind("pbkdf2$" + await pbkdf2Hex(String(b.password), row.salt, email), email).run();
     let t = (await env.DB.prepare("SELECT token FROM admin_tokens WHERE admin_email=?").bind(email).first())?.token;
     if (!t) {
       t = await genToken();
@@ -544,6 +604,8 @@ const api = {
   },
   "GET /api/admin/stats": async (env, req, p, admin) => {
     if (!admin) return json({ error: "unauthorized" }, 401);
+    // C3：顺手清 90 天前用量（防止 ai_usage 无界膨胀；统计口径不变）
+    await env.DB.prepare("DELETE FROM ai_usage WHERE ts < datetime('now','-90 day')").run().catch(() => {});
     const [users, books, chapters, usage, loops, invite] = await Promise.all([
       env.DB.prepare("SELECT COUNT(*) AS n FROM users").first(),
       env.DB.prepare("SELECT COUNT(*) AS n FROM books").first(),
@@ -666,7 +728,7 @@ const api = {
     const b = await req.json().catch(() => ({}));
     if (b.password && String(b.password).length >= 6) {
       const salt = await genToken();
-      const hash = await sha256hex(salt + ":" + email2 + ":" + b.password);
+      const hash = "pbkdf2$" + await pbkdf2Hex(b.password, salt, email2);
       await env.DB.prepare("UPDATE users SET salt=?, pass_hash=?, token='' WHERE email=?").bind(salt, hash, email2).run();
     }
     if (b.reset_token) {
@@ -765,7 +827,7 @@ Object.assign(api, {
     const title = (b.title && String(b.title).trim()) || "新章节";
     const r = await env.DB.prepare("INSERT INTO chapters(book_id, seq, title) VALUES(?,?,?)").bind(p.id, seq, title).run();
     let id = Number(r.meta?.last_rowid);
-    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM chapters").first())?.m ?? 0);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM chapters WHERE book_id=?").bind(p.id).first())?.m ?? 0);
     return json({ id, seq });
   },
   "GET /api/chapters/:id": async (env, req, p, email) => {
@@ -801,7 +863,7 @@ Object.assign(api, {
     const r = await env.DB.prepare("INSERT INTO roles(book_id, name, role_type, profile, voice, is_protagonist) VALUES(?,?,?,?,?,?)")
       .bind(p.id, String(b.name).trim(), b.role_type || "角色", b.profile || "", b.voice || "", b.is_protagonist ? 1 : 0).run();
     let id = Number(r.meta?.last_rowid);
-    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM roles").first())?.m ?? 0);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM roles WHERE book_id=?").bind(p.id).first())?.m ?? 0);
     return json({ id });
   },
   "PATCH /api/roles/:id": async (env, req, p, email) => {
@@ -831,7 +893,7 @@ Object.assign(api, {
     const r = await env.DB.prepare("INSERT INTO foreshadows(book_id, content, urgency, planted_chapter) VALUES(?,?,?,?)")
       .bind(p.id, String(b.content).trim(), Math.min(100, Math.max(0, Number(b.urgency) ?? 50)), Number(b.planted_chapter) || 0).run();
     let id = Number(r.meta?.last_rowid);
-    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM foreshadows").first())?.m ?? 0);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM foreshadows WHERE book_id=?").bind(p.id).first())?.m ?? 0);
     return json({ id });
   },
   "PATCH /api/loops/:id": async (env, req, p, email) => {
@@ -870,10 +932,12 @@ Object.assign(api, {
       }
       return json({ ok: true, added: b.items.length });
     }
+    // B5：前端不传 seq 时不再恒插 1（与既有 seq=1 撞号），取本书 MAX+1
+    const maxO = Number((await env.DB.prepare("SELECT COALESCE(MAX(seq),0) AS m FROM outline_items WHERE book_id=?").bind(p.id).first())?.m) || 0;
     const r = await env.DB.prepare("INSERT INTO outline_items(book_id, seq, title, detail) VALUES(?,?,?,?)")
-      .bind(p.id, Number(b.seq) || 1, String(b.title).trim(), b.detail || "").run();
+      .bind(p.id, Number(b.seq) || maxO + 1, String(b.title).trim(), b.detail || "").run();
     let id = Number(r.meta?.last_rowid);
-    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM outline_items").first())?.m ?? 0);
+    if (!id || Number.isNaN(id)) id = Number((await env.DB.prepare("SELECT MAX(id) AS m FROM outline_items WHERE book_id=?").bind(p.id).first())?.m ?? 0);
     return json({ id });
   },
   "PATCH /api/outline/:id": async (env, req, p, email) => {
@@ -959,7 +1023,7 @@ Object.assign(api, {
     const out = await chat(env, s, [
       { role: "system", content: "你是网文编辑。把给定章节压缩成一段不超过 400 字的卷级摘要：只保留剧情推进/角色状态变化/关键揭示/伏笔埋收，去掉具体对白与场景细节。只输出摘要文本。" },
       { role: "user", content: `${book.title} 第${from}-${to}章：\n${material}\n\n请输出卷级摘要。` },
-    ], { maxTokens: 1500, temperature: 0.3 });
+    ], { maxTokens: 1500, temperature: LLM_TUNING.summarize });
     await logUsage(env, email, "ai:summarize", true);
     await env.DB.prepare("INSERT INTO summaries(book_id, level, seq_from, seq_to, text) VALUES(?,?,?,?,?)").bind(p.id, "volume", from, to, out.slice(0, 800)).run();
     return json({ ok: true, text: out.slice(0, 800) });
@@ -983,8 +1047,12 @@ Object.assign(api, {
   // ---- 流水线（6 步链路：任务书→起草→审查→润色→提取→回写）----
   "POST /api/books/:id/pipeline": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
+    // B1：写章频控（每用户 30/小时），防恶意循环烧 LLM 预算
+    if (!(await rateLimitOk(env, "pipe:" + email, 30))) return json({ error: "限流：每小时最多写 30 章，请稍后再试", rate_limited: true }, 429);
     const book = await bookOrNone(env, p, email);
     if (!book) return json({ error: "book not found" }, 404);
+    // B3：一本书同时只跑一个流水线（防连点/连写并发双写同 seq）
+    if (!(await pipelineLockOk(env, p.id, email))) return json({ error: "这本书正在写章，请等「连写」结束或 30 分钟后再试", pipeline_busy: true }, 409);
     const b = await req.json().catch(() => ({}));
     const maxRow = await env.DB.prepare("SELECT MAX(seq) AS m FROM chapters WHERE book_id=?").bind(p.id).first();
     const target = {
@@ -1003,6 +1071,8 @@ Object.assign(api, {
     } catch (e) {
       await logUsage(env, email, `pipeline:${target.mode}`, false);
       return json({ error: String(e.message || e), seq: target.seq }, 500);
+    } finally {
+      await pipelineLockFree(env, p.id);
     }
     return json(result);
   },
@@ -1010,6 +1080,7 @@ Object.assign(api, {
   // ---- 问设定（①）：基于本书上下文包回答作者提问；缺上下文会说"需要补充"而非编造 ----
   "POST /api/books/:id/chat": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
+    if (!(await rateLimitOk(env, "chat:" + email, 30))) return json({ error: "限流：每小时最多问 30 次，请稍后再试", rate_limited: true }, 429);
     const book = await bookOrNone(env, p, email);
     if (!book) return json({ error: "book not found" }, 404);
     const b = await req.json().catch(() => ({}));
@@ -1025,7 +1096,7 @@ Object.assign(api, {
     let ok = true;
     let out;
     try {
-      out = await chat(env, s, [{ role: "system", content: sys }, { role: "user", content: usr }], { maxTokens: 2500, temperature: 0.3 });
+      out = await chat(env, s, [{ role: "system", content: sys }, { role: "user", content: usr }], { maxTokens: 2500, temperature: LLM_TUNING.chat });
     } catch (e) { ok = false; out = "LLM 调用失败：" + String(e.message || e); }
     await logUsage(env, email, "chat", ok);
     return json({ answer: out, ctx_parts: statePack.pack ? statePack.pack.split("\n").filter(Boolean).length : 0 });
@@ -1049,14 +1120,13 @@ Object.assign(api, {
       const d = new Date(Date.now() - k * 864e5).toISOString().slice(0, 10);
       daily14.push({ d, c: map[d] || 0 });
     }
-    // 连续天数：今天有写算1起；今天没写则看昨天（否则中断）
+    // 连续天数：今天有写算 1 起；今天没写则看昨天（否则中断）；加上限防回溯（B6）
     const ds = new Set((dates.results || []).map((r) => r.d));
     let probe = new Date();
-    let today = probe.toISOString().slice(0, 10);
-    if (!ds.has(today)) { probe.setDate(probe.getDate() - 1); if (!ds.has(probe.toISOString().slice(0, 10))) ds.delete("__none__"); }
+    const today = probe.toISOString().slice(0, 10);
+    if (!ds.has(today)) probe.setDate(probe.getDate() - 1);
     let streak = 0;
-    while (ds.has(probe.toISOString().slice(0, 10))) { streak++; probe.setDate(probe.getDate() - 1); }
-    if (ds.has(today)) streak += 0; // 今天已计入（loop 从 today 或 yesterday 起数）
+    while (streak < 3660 && ds.has(probe.toISOString().slice(0, 10))) { streak++; probe.setDate(probe.getDate() - 1); }
     return json({ total_words: Number(tot.w) || 0, chapters: Number(tot.c) || 0, open_loops: Number(open.c) || 0, roles: Number(nRoles.c) || 0, daily: daily14, streak });
   },
 
@@ -1065,7 +1135,9 @@ Object.assign(api, {
     if (!email) return json({ error: "unauthorized" }, 401);
     const s = await getLlm(env, email);
     const ownRow = await env.DB.prepare("SELECT provider, base_url, model, api_key FROM llm_settings WHERE user_email=?").bind(email).first();
-    return json({ provider: s.provider, base_url: s.base_url, model: s.model, has_key: !!s.api_key, using: ownRow && ownRow.api_key ? "mine" : "site" });
+    // D5：暴露 key 来源（user=自己的 / env=站点 env LLM_KEY 兜底 / site=site_llm 设置 / none=无 key），排障不再靠猜
+    const keySource = !s.api_key ? "none" : ownRow && ownRow.api_key ? "user" : env.LLM_KEY ? "env" : "site";
+    return json({ provider: s.provider, base_url: s.base_url, model: s.model, has_key: !!s.api_key, using: ownRow && ownRow.api_key ? "mine" : "site", key_source: keySource });
   },
   "POST /api/settings": async (env, req, p, email) => {
     if (!email) return json({ error: "unauthorized" }, 401);
@@ -1113,16 +1185,19 @@ Object.assign(api, {
       { role: "user", content: `【故事梗概】${book.logline || "（未填写）"}\n【世界观】${book.world_setting || "（未填写）"}\n【主要角色】${(book.characters || "")}\n\n请生成 ${count} 章大纲。${extra ? `\n额外要求：${extra}` : ""}` },
     ];
     let out = "";
-    try { out = await chat(env, s, msgs, { maxTokens: 3000, temperature: 0.9 }); await logUsage(env, email, "ai:outline", true); }
+    try { out = await chat(env, s, msgs, { maxTokens: 3000, temperature: LLM_TUNING.outline }); await logUsage(env, email, "ai:outline", true); }
     catch (e) { await logUsage(env, email, "ai:outline", false); throw e; }
     // 大纲生成后自动入库为 outline_items（可写：b.save=true）
     let added = 0;
     if (bookId && save) {
+      // C2：本地 seq 递进，不再每行查一次 MAX（N+1 → 1 次）
+      let seq = Number((await env.DB.prepare("SELECT COALESCE(MAX(seq),0) AS s FROM outline_items WHERE book_id=?").bind(bookId).first())?.s) || 0;
       const lines = out.split("\n").map((l) => l.replace(/^\s*\d+[、.．,，]\s*/, "").trim()).filter((l) => l.length >= 2);
       for (const line of lines.slice(0, count)) {
         const [t, d] = line.split("｜").map((x) => x.trim());
+        seq++;
         await env.DB.prepare("INSERT INTO outline_items(book_id, seq, title, detail) VALUES(?,?,?,?)")
-          .bind(bookId, (await env.DB.prepare("SELECT COALESCE(MAX(seq),0)+1 AS s FROM outline_items WHERE book_id=?").bind(bookId).first()).s, t, d || "").run();
+          .bind(bookId, seq, t, d || "").run();
         added++;
       }
     }
@@ -1140,7 +1215,7 @@ Object.assign(api, {
       { role: "system", content: `你是网文设定顾问。扩展并完善【${label}】：保持原有条目，补充细节（力量体系/势力/地理/配角弧光等，视类型而定），条目化输出，直接给设定文本。` },
       { role: "user", content: `现有【${label}】：${base || "（空）"}\n梗概：${book.logline || ""}\n${extra ? `额外要求：${extra}` : ""}\n\n请输出扩展后的完整${label}。` },
     ];
-    const out = await chat(env, s, msgs, { maxTokens: 3000, temperature: 0.8 });
+    const out = await chat(env, s, msgs, { maxTokens: 3000, temperature: LLM_TUNING.expand });
     if (kind === "world") await env.DB.prepare("UPDATE books SET world_setting=?, updated_at=datetime('now') WHERE id=?").bind(out, book.id).run();
     else await env.DB.prepare("UPDATE books SET characters=?, updated_at=datetime('now') WHERE id=?").bind(out, book.id).run();
     return json({ text: out });
@@ -1264,7 +1339,7 @@ Object.assign(api, {
     const displayFilename = ((book.title || "novel").replace(/[\\/:*?"<>|]/g, "_") + rangeTag + "." + ext);
     const asciiFilename = asciiTitle + rangeTag + "." + ext;
     const bytes = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-    return new Response(bytes, { headers: { "Content-Type": mime, "Access-Control-Allow-Origin": "***", "Content-Disposition": `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(displayFilename)}`, "Content-Length": String(bytes.length) } });
+    return new Response(bytes, { headers: { "Content-Type": mime, "Content-Disposition": `attachment; filename="${asciiFilename}"; filename*=UTF-8''${encodeURIComponent(displayFilename)}`, "Content-Length": String(bytes.length) } });
   },
 });
 // ---------- 前端（统一 UI：三端响应式 + 昼夜主题 + 角色/伏笔/大纲管理 + 流水线 + 管理端） ----------
@@ -1325,6 +1400,9 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--panel2);border-r
 button.ghost{background:transparent;border-style:dashed;color:var(--mut)}
 button:hover{border-color:var(--acc);filter:brightness(1.05)}
 button:active{transform:translateY(1px)}
+button.danger:hover{border-color:var(--bad)}
+button.ghost:hover{border-color:var(--mut)}
+button:disabled{opacity:.45;cursor:not-allowed}
 /* 标签栏吸顶：长列表里随时切 tab */
 .tabwrap{position:sticky;top:0;z-index:6;background:var(--bg);padding:6px 0;margin:-6px 0 10px}
 /* 长文排版：正文编辑与预览用衬线（小说阅读感） */
@@ -1355,8 +1433,8 @@ textarea.ednovel{resize:vertical;min-height:200px;font-size:15px;line-height:1.9
   <div id="view" class="muted">先登录，再新建或选择一本书。</div>
 </main>
 </div>
-<div id="statusBar"></div>
-<div id="modelPane" style="display:none">
+<div id="statusBar" role="status" aria-live="polite"></div>
+<div id="modelPane" role="dialog" aria-modal="true" style="display:none">
   <div class="card" style="max-width:460px;width:94%">
     <b>🧠 模型设置</b> <span class="muted small" id="mModelTag"></span>
     <label>服务商</label><select id="mProvider"><option value="openai">OpenAI 兼容（OpenRouter/自建/其他）</option><option value="cf-ai">Cloudflare Workers AI</option></select>
@@ -1367,7 +1445,7 @@ textarea.ednovel{resize:vertical;min-height:200px;font-size:15px;line-height:1.9
     <div id="mMsg" class="muted small" style="margin-top:6px"></div>
   </div>
 </div>
-<div id="authPane">
+<div id="authPane" role="dialog" aria-modal="true">
   <div class="card">
     <h3>登录 / 注册</h3>
     <label>邮箱</label><input id="liEmail">
@@ -1407,7 +1485,8 @@ function setAuthUI(logged){ $('#btnAuth').style.display=logged?'none':''; $('#bt
 async function refreshModelTag(){
   if(!TK)return;
   const s=await api('/api/settings').catch(()=>null);if(!s)return;
-  $('#btnModel').innerHTML='🧠 '+(s.model||'未配模型').slice(0,24)+(s.using==='site'?' <span class="badge">站点</span>':'');
+  const ks=s.key_source==='env'?' <span class="badge">env兜底</span>':(s.using==='site'?' <span class="badge">站点</span>':'');
+  $('#btnModel').innerHTML='🧠 '+escH((s.model||'未配模型').slice(0,24))+ks;
 }
 // 模型设置面板（需求④：登录后随时可改模型，不用找管理员）
 async function openModelPane(){
@@ -1448,7 +1527,7 @@ $('#btnOut').onclick=logout;
 
 async function loadBooks(){
   const books=await api('/api/books');
-  const mk=bs=>{const el=document.createElement('div');el.className='card';el.innerHTML=\`<b>\${bs.title}</b> <span class="badge">\${bs.chapter_count} 章</span>\`;el.onclick=()=>openBook(bs.id,bs.title);return el}
+  const mk=bs=>{const el=document.createElement('div');el.className='card';el.innerHTML=\`<b>\${escH(bs.title)}</b> <span class="badge">\${bs.chapter_count} 章</span>\`;el.onclick=()=>openBook(bs.id,bs.title);return el}
   const c=$('#bookList');c.innerHTML='';books.forEach(b=>c.appendChild(mk(b)));
   const m=$('#mobileBooks');m.innerHTML='';books.forEach(b=>{const el=document.createElement('button');el.className='on';el.textContent=b.title;el.style.cssText='display:block;width:100%;text-align:left;margin:4px 0';el.onclick=()=>openBook(b.id,b.title);m.appendChild(el)});
   return books;
@@ -1461,7 +1540,7 @@ async function openBook(id,title){
   const d=await api('/api/books/'+id);
   const main=$('#view');
   main.innerHTML=\`
-  <div class="card"><b>\${d.book.title}</b> <span class="badge">\${d.book.genre||'未分题材'}</span>
+  <div class="card"><b>\${escH(d.book.title)}</b> <span class="badge">\${escH(d.book.genre||'未分题材')}</span>
     <div class="muted small" style="margin:6px 0">
       写作链路：<b>1</b> 建设定（世界观/角色/伏笔）→ <b>2</b> 出大纲 → <b>3</b> 一键写下一章 → <b>4</b> 看章节结果 → <b>5</b> 导出成书。
       第一次建议顺序做；设定越全，后写的章越不跑偏。
@@ -1469,11 +1548,11 @@ async function openBook(id,title){
     <div class="row"><button class="primary" id="vPipe">⚡ 一键写下一章</button><button id="vPipeFast">快速</button><button id="vPipeMin">极简</button><button id="vPipeN">⏩ 连写N章</button><input id="vPipeNN" type="number" min="1" max="50" value="3" title="连写章数" style="width:56px"><button id="vChat">💬 问设定</button></div>
     <div class="row"><button class="ghost" id="vOutline">生成大纲</button><button class="ghost" id="vExpand">扩设定</button><button class="ghost" id="vAnti">AI味清单</button><button class="ghost" id="vExport">导出小说</button></div>
     <div class="small muted">模式区别：标准=全套 6 步（最稳）· 快速=省掉部分审查（更快）· 极简=只起草+存档（最便宜，先试水用）。写完可导出 TXT/MD/HTML/EPUB。连写=一次跑 N 章（每章独立过 6 步，可随时停）；问设定=带着全书设定/账本向 AI 提问。</div>
-    \${d.book.world_setting?\`<details><summary><b>世界观设定</b></summary><pre>\${d.book.world_setting}</pre></details>\`:\`<details class="muted"><summary>还没有世界观设定：点「扩设定」让 AI 帮你补，或在「伏笔/角色」标签里先把人立住</summary></details>\`}
-    \${d.book.characters?\`<details><summary><b>角色设定</b></summary><pre>\${d.book.characters}</pre></details>\`:''}
+    \${d.book.world_setting?\`<details><summary><b>世界观设定</b></summary><pre>\${escH(d.book.world_setting)}</pre></details>\`:\`<details class="muted"><summary>还没有世界观设定：点「扩设定」让 AI 帮你补，或在「伏笔/角色」标签里先把人立住</summary></details>\`}
+    \${d.book.characters?\`<details><summary><b>角色设定</b></summary><pre>\${escH(d.book.characters)}</pre></details>\`:''}
   </div>
-  <div class="tabwrap"><div class="tabbar">
-    \${['chapters:章节','roles:角色','loops:伏笔','outline:大纲','events:事件流','ledger:事实账本','sums:卷摘要','stats:📈看板'].map(t=>{const k=t.split(':');const openN=k[0]==='loops'?d.loops.filter(x=>x.status==='open').length:0;return '<button data-tab="'+k[0]+'" class="tb '+(k[0]===TAB?'on':'')+'">'+k[1]+(k[0]==='loops'&&openN?' <span class="badge warn">'+openN+'未收</span>':'')+'</button>'}).join('')}
+  <div class="tabwrap"><div class="tabbar" role="tablist">
+    \${['chapters:章节','roles:角色','loops:伏笔','outline:大纲','events:事件流','ledger:事实账本','sums:卷摘要','stats:📈看板'].map(t=>{const k=t.split(':');const openN=k[0]==='loops'?d.loops.filter(x=>x.status==='open').length:0;return '<button data-tab="'+k[0]+'" class="tb '+(k[0]===TAB?'on':'')+'" role="tab" aria-selected="'+(k[0]===TAB)+'">'+k[1]+(k[0]==='loops'&&openN?' <span class="badge warn">'+openN+'未收</span>':'')+'</button>'}).join('')}
   </div></div>
   <div id="tabBody"></div>
   <div id="pipePanel" style="display:none"></div><div id="exportPanel"></div>\`;
@@ -1493,19 +1572,20 @@ async function tabChapters(){
   </div>\`;
   const list=$('#chList');
   list.innerHTML=cs.length?'<table><tr><th>#</th><th>标题</th><th>状态</th><th>摘要/钩子</th><th></th></tr>'+cs.map(c=>\`
-    <tr data-id="\${c.id}"><td>\${c.seq}</td><td>\${c.title||''}</td>
+    <tr data-id="\${c.id}"><td>\${c.seq}</td><td>\${escH(c.title||'')}</td>
     <td><span class="badge \${c.status==='committed'?'ok':c.status==='rejected'?'bad':'warn'}">\${c.status||'draft'}</span></td>
-    <td class="small muted">\${(c.summary||'').slice(0,50)}\${c.hook?'<br>钩：'+(c.hook||'').slice(0,40):''}</td>
-    <td><button class="ev" data-id="\${c.id}">读</button> <button class="ed" data-id="\${c.id}">编</button> <button class="del" data-id="\${c.id}">删</button></td></tr>\`).join('')+'</table>':'<div class="muted">尚无章节。点「⚡ 一键写下一章」启动 6 步流水线。</div>';
+    <td class="small muted">\${escH((c.summary||'').slice(0,50))}\${c.hook?'<br>钩：'+escH((c.hook||'').slice(0,40)):''}</td>
+    <td><button class="ev" data-id="\${c.id}">读</button> <button class="ed" data-id="\${c.id}">编</button> <button class="del" data-id="\${c.id}">删</button></td></tr>\`).join('')+'</table>':'<div class="muted">尚无章节。<button class="primary" id="chFirstBtn">⚡ 立即写第 1 章</button> 或先建设定/大纲。</div>';
+  const cf=$('#chFirstBtn');if(cf)cf.onclick=()=>runPipe('standard');
   list.querySelectorAll('.ev').forEach(b=>b.onclick=async()=>{const r=await api('/api/chapters/'+b.dataset.id);
-    const w=document.createElement('div');w.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center;padding:16px;overflow:auto';
-    w.innerHTML='<div class="card" style="max-width:880px;width:94%;max-height:88vh;overflow:auto"><div class="row" style="justify-content:space-between"><b>📖 第'+r.seq+'章 '+escH(r.title||'')+'</b><span class="badge">'+String(r.content||'').length+' 字</span></div>'
+    const w=document.createElement('div');w.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center;padding:16px;overflow:auto';w.setAttribute('role','dialog');w.setAttribute('aria-modal','true');w.setAttribute('aria-label','读章节');
+    w.innerHTML='<div class="card" style="max-width:880px;width:96%;max-height:92vh;overflow:auto"><div class="row" style="justify-content:space-between"><b>📖 第'+r.seq+'章 '+escH(r.title||'')+'</b><span class="badge">'+String(r.content||'').length+' 字</span></div>'
       +'<pre class="novel" style="white-space:pre-wrap;margin:10px 0">'+escH(r.content||'(空章，点「编」填写正文后跑流水线)')+'</pre>'
       +(r.review_json?'<details><summary>审查记录</summary><pre style="max-height:200px;overflow:auto">'+escH(JSON.stringify(JSON.parse(r.review_json),null,1).slice(0,800))+'</pre></details>':'')
       +'<div class="row"><button class="ghost" id="pClose">关闭</button></div></div>';
     document.body.appendChild(w);
     const close=()=>w.remove();
-    w.querySelector('#pClose').onclick=close;
+    w.querySelector('#pClose').onclick=close;w.querySelector('#pClose').focus();
     w.addEventListener('click',e=>{if(e.target===w)close()});
     window.addEventListener('keydown',function onk(e){if(e.key==='Escape'){close();window.removeEventListener('keydown',onk)}});
   });
@@ -1519,7 +1599,7 @@ const escH=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/
 const escAttr=s=>escH(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 async function editCh(id){
   const r=await api('/api/chapters/'+id);
-  const el=document.createElement('div');el.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center;overflow:auto;padding:16px';
+  const el=document.createElement('div');el.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center;overflow:auto;padding:16px';el.setAttribute('role','dialog');el.setAttribute('aria-modal','true');el.setAttribute('aria-label','编辑章节');
   el.innerHTML='<div class="card" style="max-width:880px;width:96%;max-height:92vh;overflow:auto">'
     +'<div class="row" style="justify-content:space-between"><b>✏️ 编辑第'+r.seq+'章</b><span class="badge" id="eWcnt"></span></div>'
     +'<label>标题</label><input id="eTitle" value="'+escAttr(r.title)+'">'
@@ -1530,6 +1610,7 @@ async function editCh(id){
     +'<div class="row"><button class="primary" id="eSave">保存</button><button class="ghost" id="eCancel">取消</button><span class="muted small">Ctrl+S 保存 · Esc 关闭 · 正文约 2000 字/章</span></div>'
     +'</div>';
   document.body.appendChild(el);
+  $('#eTitle').focus();
   const tc=()=>{const n=$('#eContent').value.length;$('#eWcnt').textContent=n?n+' 字':(String(r.content||'').length+' 字（未改）');$('#eWcnt').classList.toggle('warn',n&&n<800)};
   $('#eContent').addEventListener('input',tc);tc();
   const close=()=>{el.remove();window.removeEventListener('keydown',onkey)};
@@ -1555,12 +1636,12 @@ async function tabRoles(){
     <div class="row"><input id="rName" placeholder="角色名" style="width:140px"><select id="rType"><option>角色</option><option>组织</option><option>地点</option><option>物品</option><option>势力</option></select>
     <input id="rVoice" placeholder="声纹（口头禅/用词/信息量）" style="width:220px">
     <label class="small" style="display:inline"><input type="checkbox" id="rProto"> 主角</label><button class="primary" id="rAdd">＋</button></div>
-    \${d.roles.map(r=>\`<div class="row"><b>\${r.name}</b> <span class="badge">\${r.role_type}</span>\${r.is_protagonist?' <span class="badge ok">主角</span>':''}
-      <span class="muted small">\${r.profile||''}</span>\${r.state_note?\` <span class="badge warn">状态：\${r.state_note}</span>\`:''}
-      <input class="rv" data-id="\${r.id}" data-val="\${escH(r.voice||'')}" placeholder="声纹（口头禅/用词/信息量）" style="width:220px" value="\${escH(r.voice||'')}"> <button class="rvSave" data-id="\${r.id}">存声纹</button>
+    \${d.roles.map(r=>\`<div class="row"><b>\${escH(r.name)}</b> <span class="badge">\${escH(r.role_type)}</span>\${r.is_protagonist?' <span class="badge ok">主角</span>':''}
+      <span class="muted small">\${escH(r.profile||'')}</span>\${r.state_note?\` <span class="badge warn">状态：\${escH(r.state_note)}</span>\`:''}
+      <input class="rv" data-id="\${r.id}" data-val="\${escAttr(r.voice||'')}" placeholder="声纹（口头禅/用词/信息量）" style="width:220px" value="\${escAttr(r.voice||'')}"> <button class="rvSave" data-id="\${r.id}">存声纹</button>
       <button class="rm" data-id="\${r.id}">删</button></div>\`).join('')}
   </div>\`;
-  $('#rAdd').onclick=async()=>{await api(\`/api/books/\${BK}/roles\`,{method:'POST',body:{name:$('#rName').value,type:$('#rType').value,role_type:$('#rType').value,profile:'',voice:$('#rVoice').value.trim(),is_protagonist:$('#rProto').checked}});tabRoles()};
+  $('#rAdd').onclick=async()=>{await api(\`/api/books/\${BK}/roles\`,{method:'POST',body:{name:$('#rName').value,role_type:$('#rType').value,profile:'',voice:$('#rVoice').value.trim(),is_protagonist:$('#rProto').checked}});tabRoles()};
   document.querySelectorAll('.rvSave').forEach(b=>b.onclick=async()=>{const inp=document.querySelector('.rv[data-id="'+b.dataset.id+'"]');const v=inp.value.trim();const body=v?{voice:v}:{voice:''};await api('/api/roles/'+b.dataset.id,{method:'PATCH',body});tabRoles()});
   document.querySelectorAll('.rm').forEach(b=>b.onclick=async()=>{await api('/api/roles/'+b.dataset.id,{method:'DELETE'});tabRoles()});
 }
@@ -1571,7 +1652,7 @@ async function tabLoops(){
   $('#tabBody').innerHTML=\`<div class="card"><b>伏笔（open_loop）</b> \${urgent.length?\`<span class="badge bad">\${urgent.length} 条紧急，将强制进入下一章任务书</span>\`:''}
     <div class="row"><input id="fContent" placeholder="新伏笔" style="flex:1"><input id="fUrg" type="number" min="0" max="100" value="50" title="紧急度 0-100" style="width:70px"><button class="primary" id="fAdd">＋ 埋设</button></div>
     \${d.loops.map(l=>\`<div class="row"><span class="badge \${l.status==='paid'?'ok':'warn'}">\${l.status==='paid'?'已回收':'未回收'}</span>
-      <span class="small">\${l.content}</span><span class="muted small">埋@\${l.planted_chapter||'?'}</span>
+      <span class="small">\${escH(l.content)}</span><span class="muted small">埋@\${l.planted_chapter||'?'}</span>
       <input class="lp" data-id="\${l.id}" type="number" min="1" placeholder="回收章" style="width:70px" value="\${l.payoff_chapter||''}">
       \${l.status==='open'?\`<button class="pay" data-id="\${l.id}" title="标记已回收（可填回收章）">✓</button> <button class="del" data-id="\${l.id}">删</button>\`:''}</div>\`).join('')}
   </div>\`;
@@ -1584,7 +1665,7 @@ async function tabOutline(){
   const d=await api('/api/books/'+BK);
   $('#tabBody').innerHTML=\`<div class="card"><b>大纲（法律）</b>
     <div class="row"><input id="oTitle" placeholder="章纲标题" style="flex:1"><input id="oDetail" placeholder="本章要点/禁区（可选）" style="flex:1"><button class="primary" id="oAdd">＋</button></div>
-    \${d.outline.map(o=>\`<div class="row"><span class="badge">\${o.status}</span> <b>\${o.seq}、\${o.title}</b> \${o.detail?\`<span class="muted small">\${o.detail}</span>\`:''}
+    \${d.outline.map(o=>\`<div class="row"><span class="badge">\${o.status}</span> <b>\${o.seq}、\${escH(o.title)}</b> \${o.detail?\`<span class="muted small">\${escH(o.detail)}</span>\`:''}
       \${o.status!=='done'?\`<button class="adv" data-id="\${o.id}">推进</button>\`:''} <button class="del" data-id="\${o.id}">删</button></div>\`).join('')||'<div class="muted">无大纲。点「生成大纲」用 AI 出章纲并入库。</div>'}
   </div>\`;
   $('#oAdd').onclick=async()=>{await api(\`/api/books/\${BK}/outline\`,{method:'POST',body:{title:$('#oTitle').value,detail:$('#oDetail').value}});tabOutline()};
@@ -1595,7 +1676,7 @@ async function tabOutline(){
 async function tabEvents(){
   const es=await api('/api/books/'+BK+'/events');
   const label={open_loop_created:'埋伏笔',open_loop_closed:'收伏笔',character_state_changed:'状态变更',power_breakthrough:'突破',relationship_changed:'关系',world_rule_revealed:'规则',promise_created:'立誓',promise_paid_off:'偿约',artifact_obtained:'得物'};
-  let rows=es.slice().reverse().map(e=>'<div class="row small"><span class="badge">'+e.chapter_seq+'章</span> <b>'+(label[e.event_type]||e.event_type)+'</b> '+(e.subject||'')+' <span class="muted">'+(e.payload||'')+'</span></div>').join('');
+  let rows=es.slice().reverse().map(e=>'<div class="row small"><span class="badge">'+escH(String(e.chapter_seq??''))+'章</span> <b>'+escH(label[e.event_type]||e.event_type)+'</b> '+escH(e.subject||'')+' <span class="muted">'+escH(typeof e.payload==='string'?e.payload:JSON.stringify(e.payload||''))+'</span></div>').join('');
   if(!rows)rows='<div class="muted">暂无事件。写完一章（含回写）后这里会有记录。</div>';
   $('#tabBody').innerHTML='<div class="card"><b>事件流</b>（data-agent 回写的跨章事实，供后续任务书引用）'+rows+'</div>';
 }
@@ -1626,18 +1707,18 @@ async function tabSums(){
   if(rows.length){list=rows.map(s=>'<div class="card small"><b>第'+s.seq_from+'-'+s.seq_to+'章</b> <span class="muted">卷级</span><pre>'+escH(s.text)+'</pre><button class="sDel" data-id="'+s.id+'">删</button></div>').join('');}
   else list='<div class="muted">暂无卷摘要。点「AI 生成卷摘要」把一段章节压缩成 400 字卷摘。</div>';
   $('#tabBody').innerHTML=head+list+'</div>';
-  $('#sGen').onclick=async()=>{try{const r=await api('/api/books/'+BK+'/summaries',{method:'POST',body:{from:+$('#sFrom').value,to:+$('#sTo').value}});toast('已生成卷摘要：<pre>'+escH(r.text.slice(0,300))+'</pre>');tabSums()}catch(e){toast(e.message,'bad')}};
+  $('#sGen').onclick=async()=>{const b=$('#sGen');b.disabled=true;b.textContent='⏳ 生成中…';try{const r=await api('/api/books/'+BK+'/summaries',{method:'POST',body:{from:+$('#sFrom').value,to:+$('#sTo').value}});toast('已生成卷摘要：<pre>'+escH(r.text.slice(0,300))+'</pre>');tabSums()}catch(e){b.disabled=false;b.textContent='⚡ AI 生成卷摘要';toast(e.message,'bad')}};
   document.querySelectorAll('.sDel').forEach(b=>b.onclick=async()=>{await api('/api/summaries/'+b.dataset.id,{method:'DELETE'});tabSums()});
 }
 
 // ---- 生成大纲并入库 ----
-async function genOutline(){try{const r=await api('/api/ai/outline',{method:'POST',body:{bookId:BK,count:10,save:true}});toast('已生成并入库 '+r.added+' 条章纲<br><pre>'+r.text.slice(0,400)+'</pre>');tabOutline()}catch(e){toast(e.message,'bad')}}
+async function genOutline(){const b=$('#vOutline');b.disabled=true;try{const r=await api('/api/ai/outline',{method:'POST',body:{bookId:BK,count:10,save:true}});toast('已生成并入库 '+r.added+' 条章纲<br><pre>'+escH(r.text.slice(0,400))+'</pre>');tabOutline()}catch(e){toast(e.message,'bad')}finally{b.disabled=false}}
 async function expandSetting(){try{const r=await api('/api/ai/expand-setting',{method:'POST',body:{bookId:BK,kind:'world'}});toast('设定已扩展（可切到世界观查看）')}catch(e){toast(e.message,'bad')}}
 
 // ---- AI 味负面清单（本书定制，写章/润色/校验全链路生效；留空=用站点默认）----
 async function editAnti(){
   const d=await api('/api/books/'+BK);
-  const el=document.createElement('div');el.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center';
+  const el=document.createElement('div');el.style.cssText='position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.55);display:grid;place-items:center';el.setAttribute('role','dialog');el.setAttribute('aria-modal','true');el.setAttribute('aria-label','AI 味负面清单');
   el.innerHTML='<div class="card" style="max-width:560px;width:94%">'
     +'<b>AI 味负面清单</b>（本书定制；起草/润色/校验全链路生效。留空=用站点默认）'
     +'<textarea id="antiTxt" rows="6" style="width:100%">'+escH(d.book.anti_ai_rules||'')+'</textarea>'
@@ -1679,8 +1760,11 @@ async function showExportPanel(){
 }
 
 // ---- 6 步流水线 UI（通俗版：横向步骤条 + 每步白话说明 + 状态栏忙碌提示） ----
+// U2：写章入口忙锁（防重复触发并发烧 LLM 预算；后端 409 忙锁兜底见 pipeline_lock）
+function pipeBusy(on){['vPipe','vPipeFast','vPipeMin','vPipeN'].forEach(id=>{const b=$('#'+id);if(b){b.disabled=on;if(on)b.classList.add('busy');else b.classList.remove('busy')}})}
 async function runPipe(mode){
   const p=$('#pipePanel');p.style.display='';
+  pipeBusy(true);
   const modeZh={standard:'标准（全 6 步）',fast:'快速（省部分审查）',minimal:'极简（只起草+回写）'}[mode]||mode;
   const steps=[
     ['任务书','先想清楚这章要写什么、谁出场、节奏怎么走'],
@@ -1721,6 +1805,7 @@ async function runPipe(mode){
       <details><summary>摘要 / 钩子</summary><pre>\${escH(r.summary||'(空)')}\${r.hook?'\\n钩：'+escH(r.hook):''}</pre></details>
       <div class="muted small">去「章节」标签看结果；「事实账本」「角色」标签里能看到刚回写的内容。</div>
     </div>\`;
+    pipeBusy(false);
     p.querySelectorAll('[data-rerun]').forEach(b=>b.onclick=()=>runPipe(b.dataset.rerun));
     if(TAB==='chapters')tabChapters();
     toast('第'+r.seq+'章已写完'+(r.status==='committed'?'，自动存档':'，有硬伤需处理'));
@@ -1730,6 +1815,7 @@ async function runPipe(mode){
     toast('写章失败：'+e.message,'bad');
     p.innerHTML=\`<div class="card"><b>✗ 写章失败</b><div>\${escH(e.message)}</div>
       <div class="muted small">常见原因：模型没配置 / Key 失效。点顶部「🧠 模型」检查并测试连通。</div></div>\`;
+    pipeBusy(false);
   }
 }
 
@@ -1738,6 +1824,7 @@ let _stopPipe=false;
 async function runPipeN(){
   const n=Math.max(1,Math.min(50,parseInt($('#vPipeNN').value)||3));
   _stopPipe=false;
+  pipeBusy(true);
   const p=$('#pipePanel');p.style.display='';
   p.innerHTML='<div class="card"><b>⏩ 连写 '+n+' 章（快速模式）</b>'
     +'<div class="muted small">每章独立跑 6 步（快速），状态栏逐章刷新。预计共 '+(n*2)+'-'+(n*4)+' 分钟。</div>'
@@ -1761,6 +1848,7 @@ async function runPipeN(){
     }
     $('#pnList').scrollTop=$('#pnList').scrollHeight;
   }
+  pipeBusy(false);
   status('','hide');
   $('#pnStop').style.display='none';
   if(TAB==='chapters')tabChapters();
@@ -1771,7 +1859,7 @@ async function runPipeN(){
 async function openChatPane(){
   let pane=$('#chatPane');
   if(!pane){pane=document.createElement('div');pane.id='chatPane';document.body.appendChild(pane)}
-  pane.style.cssText='display:grid;position:fixed;inset:0;z-index:56;place-items:center;background:rgba(0,0,0,.55)';
+  pane.style.cssText='display:grid;position:fixed;inset:0;z-index:56;place-items:center;background:rgba(0,0,0,.55)';pane.setAttribute('role','dialog');pane.setAttribute('aria-modal','true');
   // 每次打开按当前书重建（历史问答属于上一本书，不能带脏数据）
   pane.innerHTML='<div class="card" style="max-width:620px;width:94%;max-height:80vh;overflow:auto">'
     +'<div class="row" style="align-items:center"><b>💬 问设定</b><span class="muted small">本书专属：AI 基于世界观/角色/伏笔/事实账本/近3章摘要回答；没覆盖的会说「需补充」不编造。</span></div>'
@@ -1846,8 +1934,8 @@ async function openAdmin(){
 async function showAdmin(){
   const main=$('#view');
   const tabs=[['overview','📊 概览'],['users','👥 会员管理'],['codes','🎫 注册码'],['llm','🧠 模型管理'],['site','⚙️ 站点 & SEO']];
-  main.innerHTML=\`<div class="tabbar">
-    \${tabs.map(t=>\`<button data-atab="\${t[0]}" class="tb \${t[0]===ADMTAB?'on':''}">\${t[1]}</button>\`).join('')}
+  main.innerHTML=\`<div class="tabbar" role="tablist">
+    \${tabs.map(t=>\`<button data-atab="\${t[0]}" class="tb \${t[0]===ADMTAB?'on':''}" role="tab" aria-selected="\${t[0]===ADMTAB}">\${escH(t[1])}</button>\`).join('')}
     <button data-atab="__out" style="margin-left:auto">管理员退出</button>
   </div><div id="aBody"></div>\`;
   main.querySelectorAll('[data-atab]').forEach(b=>b.onclick=async()=>{
@@ -1985,8 +2073,8 @@ export default {
     const url = new URL(req.url);
     if (req.method === "OPTIONS")
       return new Response(null, {
+        status: 204,
         headers: {
-          "Access-Control-Allow-Origin": "*",
           "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type,Authorization",
         },

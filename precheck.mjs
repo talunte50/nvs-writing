@@ -48,11 +48,27 @@ const must = [
   "admFetch", "statusBar", "btnModel", "openModelPane", "adminUsers", "adminLlm", "adminSite",
   "runPipeN", "openChatPane", "tabStats", "vPipeN", "vChat",
   "escAttr", "ednovel", "tabwrap", "chatClear", "eWcnt", "pClose",
+  // 四维审查回归（2026-09）：忙锁 UI / 属性转义（浏览器 JS 侧）
+  "pipeBusy", "chFirstBtn",
 ];
 for (const m of must) {
   if (!browserJs.includes(m)) throw new Error(`浏览器 JS 缺少关键符号：${m}`);
 }
+// a11y：statusBar role/aria-live 在 HTML 模板（非 script）
+for (const m of ['role="status"', "aria-live=\"polite\""]) {
+  if (!html.includes(m)) throw new Error(`HTML 缺少 a11y 属性：${m}`);
+}
 console.log("✓ 关键前端符号齐全");
+
+// 4b) 后端符号存在性断言（防误删：频控 / 忙锁 / PBKDF2 / 调参集中，四维审查回归）
+const backendMust = [
+  "rateLimitOk", "pipelineLockOk", "pipelineLockFree", "pbkdf2Hex", "verifyPassword",
+  "LLM_TUNING", "key_source", "SELECT n, ts FROM rate_limit", "INSERT INTO pipeline_lock",
+];
+for (const m of backendMust) {
+  if (!src.includes(m)) throw new Error(`worker 缺少后端符号：${m}`);
+}
+console.log("✓ 关键后端符号齐全");
 
 // 5) 后端路由存在性断言（防误删导出/管理路由）
 const routes = [

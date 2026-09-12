@@ -27,7 +27,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 24：node:sqlite（test-local 的 D1 mock）免实验标志；Node 20/22 需 --experimental-sqlite
+          node-version: 24
+
+      - name: Precheck (worker 本体 + 内嵌浏览器 JS 双语法校验)
+        run: node precheck.mjs worker.js
+
+      - name: Local regression (mock D1 + mock LLM，26 项断言)
+        run: node test-local.mjs worker.js
 
       - name: Ensure D1 + apply schema
         run: node .github/scripts/ensure-resources.mjs
